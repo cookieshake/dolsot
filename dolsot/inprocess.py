@@ -76,10 +76,13 @@ def _run_cell(
 
 
 class InProcessSession:
-    """One turn-scoped live namespace. Create per turn, discard at turn end — the
-    consumer owns the lifecycle (dolsot keeps no registry). Injected values are
-    live objects placed as-is; state persists between cells by reference. NOT a
-    sandbox: pass `check`/`safe_builtins` to raise the (leaky) defense line."""
+    """One live namespace, turn-scoped by default. Create per turn, discard at
+    turn end — the consumer owns the lifecycle (dolsot keeps no registry). It may
+    instead be kept long-lived across turns: call `update_namespace` between cells
+    to re-bind the request-scoped objects it exposes (a fresh toolbox, a new
+    queue) while user state persists. Injected values are live objects placed
+    as-is; state persists between cells by reference. NOT a sandbox: pass
+    `check`/`safe_builtins` to raise the (leaky) defense line."""
 
     def __init__(
         self,
@@ -100,6 +103,17 @@ class InProcessSession:
         self._builtins = dict(safe_builtins) if safe_builtins is not None else dict(vars(builtins))
         self._timeout = timeout
         self._max_output = max_output
+
+    def update_namespace(self, mapping: dict) -> None:
+        """Replace or add injected live objects in the live namespace between cells.
+
+        The given keys become (or stay) injected keys — excluded from ``held`` — so
+        re-binding is symmetric with the ``inject`` given at construction. Use this to
+        keep a session alive past a single turn while swapping the request-scoped
+        objects it exposes (a fresh toolbox, a new queue) each turn; user-defined
+        state (see ``held``) is left untouched."""
+        self._ns.update(mapping)
+        self._injected_keys |= set(mapping)
 
     def _held(self) -> list[str]:
         # list(self._ns) snapshots the keys before filtering: on an arun timeout

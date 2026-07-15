@@ -114,6 +114,27 @@ def test_held_lists_user_names_not_injected_ones():
     assert "nn" not in r.held and "pre" not in r.held
 
 
+def test_update_namespace_rebinds_injected_object_keeping_user_state():
+    """A long-lived session swaps its request-scoped toolbox between turns via
+    update_namespace, while user-defined state persists by reference."""
+    first, second = _Live(), _Live()
+    s = InProcessSession(inject={"nn": first})
+    s.run("saved = nn.add(1, 1)")          # user state from turn 1
+    s.update_namespace({"nn": second})      # turn 2: fresh toolbox, same session
+    r = s.run("(nn.add(10, 10), saved)")
+    assert r.value == "(20, 2)"             # new object answered; old state survived
+    assert first.calls == 1 and second.calls == 1
+
+
+def test_update_namespace_added_key_is_not_held():
+    s = InProcessSession(inject={})
+    s.run("mine = 1")
+    s.update_namespace({"nn": _Live()})
+    r = s.run("mine")
+    assert "nn" not in r.held               # re-injected key excluded from held
+    assert "mine" in r.held
+
+
 def test_gate_can_be_opted_in():
     from dolsot.sandbox import check_ast
     s = InProcessSession(inject={}, check=check_ast)
