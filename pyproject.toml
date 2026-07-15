@@ -1,0 +1,39 @@
+[project]
+name = "dolsot"
+version = "0.1.0"
+description = "Toolbox-agnostic stateful Python REPL engine for LLM agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "cookieshake", email = "cookieshake.prsn@gmail.com" }]
+keywords = ["repl", "llm", "agent", "code-execution", "toolbox"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Interpreters",
+]
+dependencies = ["dill>=0.3.8"]
+
+# The `ty` type gate is optional: without it the gate fails open (a no-op), so the
+# REPL still runs. Install `dolsot[typecheck]` to get pre-execution type checking.
+[project.optional-dependencies]
+typecheck = ["ty>=0.0.1a1"]
+
+[project.scripts]
+dolsot = "dolsot.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ty>=0.0.1a1"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
