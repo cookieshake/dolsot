@@ -24,6 +24,11 @@ dependencies = ["dill>=0.3.8"]
 [project.optional-dependencies]
 typecheck = ["ty>=0.0.1a1"]
 
+[project.urls]
+Homepage = "https://github.com/cookieshake/dolsot"
+Repository = "https://github.com/cookieshake/dolsot"
+Issues = "https://github.com/cookieshake/dolsot/issues"
+
 [project.scripts]
 dolsot = "dolsot.cli:main"
 
