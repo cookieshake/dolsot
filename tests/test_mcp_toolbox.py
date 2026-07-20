@@ -206,3 +206,24 @@ def test_on_error_hook_maps_exception():
     with McpToolbox(make_connect(session), on_error=mapper) as tb:
         with pytest.raises(MyError, match="web_search failed"):
             tb.web_search(query="x")
+
+
+def test_tools_returns_specs():
+    session = FakeSession(tools=[_search_tool(), _add_tool()])
+    with McpToolbox(make_connect(session)) as tb:
+        names = [spec.name for spec in tb.tools()]
+        assert names == ["web_search", "add"]
+
+
+def test_catalog_renders_signatures():
+    session = FakeSession(tools=[_add_tool()])
+    with McpToolbox(make_connect(session)) as tb:
+        catalog = tb.catalog()
+        assert "add(a, b)" in catalog
+        assert "# Add two numbers" in catalog
+
+
+def test_help_matches_catalog():
+    session = FakeSession(tools=[_search_tool()])
+    with McpToolbox(make_connect(session)) as tb:
+        assert tb.help() == tb.catalog()

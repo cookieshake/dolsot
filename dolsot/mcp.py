@@ -156,6 +156,22 @@ class McpToolbox:
             return self._on_result(name, value)
         return value
 
+    def tools(self):
+        self._ensure_started()
+        return list(self._specs.values())
+
+    def catalog(self):
+        self._ensure_started()
+        lines = []
+        for spec in self._specs.values():
+            params = ", ".join((spec.input_schema.get("properties") or {}).keys())
+            suffix = f"  # {spec.description}" if spec.description else ""
+            lines.append(f"{spec.name}({params}){suffix}")
+        return "\n".join(lines)
+
+    def help(self):
+        return self.catalog()
+
     def close(self):
         if not self._started:
             return
