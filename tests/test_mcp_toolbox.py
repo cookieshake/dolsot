@@ -270,3 +270,75 @@ def test_http_merges_bearer_token_into_headers(monkeypatch):
             tb._loop.close()
             tb._loop = None
     assert captured["headers"] == {"X-A": "1", "Authorization": "Bearer secret"}
+
+
+def test_session_open_and_close_happen_in_one_task():
+    import anyio
+    from contextlib import asynccontextmanager
+
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={"ok": True})},
+    )
+
+    @asynccontextmanager
+    async def scoped_connect():
+        # A real anyio cancel scope, like the MCP SDK's transports/ClientSession.
+        # Exiting it from a different task than entered raises RuntimeError.
+        async with anyio.create_task_group():
+            await session.initialize()
+            yield session
+
+    tb = McpToolbox(scoped_connect)
+    try:
+        assert tb.web_search(query="x") == {"ok": True}
+    finally:
+        tb.close()  # must NOT raise a cancel-scope "different task" error
+    assert tb._started is False
+    assert tb._loop is None
+
+
+def test_call_reaches_tool_whose_name_shadows_a_method():
+    close_tool = FakeTool("close", "a tool literally named close", {"type": "object", "properties": {}})
+    session = FakeSession(
+        tools=[close_tool],
+        results={"close": FakeResult(structured={"done": True})},
+    )
+    with McpToolbox(make_connect(session)) as tb:
+        assert callable(tb.close)  # attribute access returns the METHOD, not the tool
+        assert tb.call("close") == {"done": True}  # escape hatch reaches the tool
+
+
+def test_call_unknown_tool_raises():
+    session = FakeSession(tools=[_search_tool()])
+    with McpToolbox(make_connect(session)) as tb:
+        with pytest.raises(AttributeError, match="no tool named 'missing'"):
+            tb.call("missing")
+
+
+def test_falsy_structured_value_is_not_discarded():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={})},
+    )
+    with McpToolbox(make_connect(session)) as tb:
+        assert tb.web_search(query="x") == {}
+
+    session_zero = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured=0)},
+    )
+    with McpToolbox(make_connect(session_zero)) as tb:
+        assert tb.web_search(query="x") == 0
+
+
+def test_use_after_close_raises():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={"ok": True})},
+    )
+    tb = McpToolbox(make_connect(session))
+    assert tb.web_search(query="x") == {"ok": True}
+    tb.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        tb.call("web_search", query="x")

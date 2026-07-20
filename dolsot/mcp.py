@@ -12,13 +12,15 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 _INSTALL_HINT = (
     "MCP support requires the optional dependency. "
     "Install it with: pip install 'dolsot[mcp]'"
 )
+
+_SHUTDOWN = object()
 
 
 class McpToolError(Exception):
@@ -61,18 +63,29 @@ class _Loop:
 
 
 class McpToolbox:
-    """Exposes an MCP server's tools as synchronous callables for a dolsot cell."""
+    """Exposes an MCP server's tools as synchronous callables for a dolsot cell.
+
+    A single background thread runs one asyncio event loop. One long-lived
+    "service" coroutine owns the whole MCP session lifecycle: it opens the
+    connection, discovers tools, then services a queue of tool-call requests,
+    and finally closes the connection. Because the connection is opened AND
+    closed inside that one coroutine (one asyncio task), anyio's requirement
+    that a cancel scope be exited in the task that entered it is satisfied.
+    """
 
     def __init__(self, connect, *, on_result=None, on_error=None):
         self._connect = connect
         self._on_result = on_result
         self._on_error = on_error
         self._loop = None
-        self._stack = None
-        self._session = None
+        self._queue = None
+        self._ready = None
+        self._service_future = None
+        self._start_error = None
         self._specs = {}
         self._bound = {}
         self._started = False
+        self._closed = False
 
     @classmethod
     def http(cls, url, *, token=None, headers=None, on_result=None, on_error=None):
@@ -104,36 +117,91 @@ class McpToolbox:
 
         return cls(_connect, on_result=on_result, on_error=on_error)
 
+    async def _service(self):
+        # Runs entirely in ONE task on the background loop: open -> discover ->
+        # serve queue -> close. Enter and exit of the connection happen here.
+        try:
+            async with self._connect() as session:
+                try:
+                    listing = await session.list_tools()
+                    for tool in listing.tools:
+                        self._specs[tool.name] = McpToolSpec(
+                            name=tool.name,
+                            description=tool.description or "",
+                            input_schema=tool.inputSchema or {},
+                        )
+                except BaseException as exc:  # noqa: BLE001
+                    self._start_error = exc
+                    self._ready.set()
+                    return  # exits the async-with in THIS task, closing session
+                self._ready.set()
+                while True:
+                    item = await self._queue.get()
+                    if item is _SHUTDOWN:
+                        break
+                    name, arguments, fut = item
+                    try:
+                        result = await session.call_tool(name, arguments)
+                    except BaseException as exc:  # noqa: BLE001
+                        if not fut.done():
+                            fut.set_exception(exc)
+                    else:
+                        if not fut.done():
+                            fut.set_result(result)
+        except BaseException as exc:  # noqa: BLE001
+            # Connection could not be opened (or an error escaped after open).
+            if self._ready is not None and not self._ready.is_set():
+                self._start_error = exc
+                self._ready.set()
+        finally:
+            self._fail_pending()
+
+    def _fail_pending(self):
+        # Fail any still-queued requests so callers never hang after shutdown.
+        queue = self._queue
+        if queue is None:
+            return
+        while not queue.empty():
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item is _SHUTDOWN:
+                continue
+            _, _, fut = item
+            if not fut.done():
+                fut.set_exception(RuntimeError("McpToolbox session is closed"))
+
     def _ensure_started(self):
+        if self._closed:
+            raise RuntimeError("McpToolbox is closed")
         if self._started:
             return
         self._loop = _Loop()
+        loop = self._loop._loop
 
-        async def _startup():
-            self._stack = AsyncExitStack()
-            self._session = await self._stack.enter_async_context(self._connect())
-            listing = await self._session.list_tools()
-            for tool in listing.tools:
-                self._specs[tool.name] = McpToolSpec(
-                    name=tool.name,
-                    description=tool.description or "",
-                    input_schema=tool.inputSchema or {},
-                )
+        async def _setup():
+            self._queue = asyncio.Queue()
+            self._ready = asyncio.Event()
 
-        try:
-            self._loop.run(_startup())
-        except Exception:
-            if self._stack is not None:
-                try:
-                    self._loop.run(self._stack.aclose())
-                except Exception:
-                    pass
+        asyncio.run_coroutine_threadsafe(_setup(), loop).result()
+        self._service_future = asyncio.run_coroutine_threadsafe(self._service(), loop)
+        # Block until the service task has connected + discovered (or failed).
+        asyncio.run_coroutine_threadsafe(self._ready.wait(), loop).result()
+
+        if self._start_error is not None:
+            error = self._start_error
+            # The service task already unwound its own connection in-task and
+            # returned; just stop the loop/thread and reset state.
+            self._service_future.result()
             self._loop.close()
             self._loop = None
-            self._stack = None
-            self._session = None
+            self._queue = None
+            self._ready = None
+            self._service_future = None
+            self._start_error = None
             self._specs = {}
-            raise
+            raise error
         self._started = True
 
     def __getattr__(self, name):
@@ -151,17 +219,34 @@ class McpToolbox:
         return fn
 
     def _make_callable(self, spec):
-        props = list((spec.input_schema.get("properties") or {}).keys())
+        def fn(*args, **kwargs):
+            return self.call(spec.name, *args, **kwargs)
 
-        def call(*args, **kwargs):
-            merged = self._merge_args(spec.name, props, args, kwargs)
-            result = self._loop.run(self._session.call_tool(spec.name, merged))
-            return self._handle_result(spec.name, result)
+        fn.__name__ = spec.name
+        fn.__qualname__ = spec.name
+        fn.__doc__ = spec.description
+        return fn
 
-        call.__name__ = spec.name
-        call.__qualname__ = spec.name
-        call.__doc__ = spec.description
-        return call
+    def call(self, name, *args, **kwargs):
+        """Invoke a tool by name. Escape hatch for tools whose names collide
+        with McpToolbox's own methods/attributes (e.g. a tool named ``help``)."""
+        self._ensure_started()
+        if name not in self._specs:
+            raise AttributeError(f"MCP server exposes no tool named {name!r}")
+        props = list((self._specs[name].input_schema.get("properties") or {}).keys())
+        merged = self._merge_args(name, props, args, kwargs)
+        raw = self._call_tool(name, merged)
+        return self._handle_result(name, raw)
+
+    def _call_tool(self, name, arguments):
+        loop = self._loop._loop
+
+        async def _enqueue():
+            fut = loop.create_future()
+            await self._queue.put((name, arguments, fut))
+            return await fut
+
+        return asyncio.run_coroutine_threadsafe(_enqueue(), loop).result()
 
     def _merge_args(self, name, props, args, kwargs):
         if len(args) > len(props):
@@ -203,15 +288,26 @@ class McpToolbox:
         return self.catalog()
 
     def close(self):
-        if not self._started:
+        if self._closed:
             return
-        if self._stack is not None:
-            self._loop.run(self._stack.aclose())
-            self._stack = None
-        self._loop.close()
-        self._loop = None
-        self._session = None
-        self._started = False
+        if not self._started:
+            if self._loop is not None:
+                self._loop.close()
+                self._loop = None
+            self._closed = True
+            return
+        loop = self._loop._loop
+        try:
+            asyncio.run_coroutine_threadsafe(self._queue.put(_SHUTDOWN), loop).result()
+            self._service_future.result()  # wait for in-task connection teardown
+        finally:
+            self._loop.close()
+            self._loop = None
+            self._queue = None
+            self._ready = None
+            self._service_future = None
+            self._started = False
+            self._closed = True
 
     def __enter__(self):
         return self
