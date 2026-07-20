@@ -90,3 +90,119 @@ def test_failed_startup_leaves_no_leaked_loop_and_close_is_noop():
     assert tb._loop is None
     # A subsequent close() must be a safe no-op, not raise or hang.
     tb.close()
+
+
+def _add_tool():
+    return FakeTool(
+        "add",
+        "Add two numbers",
+        {
+            "type": "object",
+            "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+        },
+    )
+
+
+def test_positional_args_map_to_schema_order():
+    session = FakeSession(
+        tools=[_add_tool()],
+        results={"add": lambda args: FakeResult(structured={"sum": args["a"] + args["b"]})},
+    )
+    with McpToolbox(make_connect(session)) as tb:
+        assert tb.add(5, 3) == {"sum": 8}
+        assert session.calls[-1] == ("add", {"a": 5, "b": 3})
+
+
+def test_too_many_positionals_raises_type_error():
+    session = FakeSession(tools=[_add_tool()])
+    with McpToolbox(make_connect(session)) as tb:
+        with pytest.raises(TypeError, match="at most 2 positional"):
+            tb.add(1, 2, 3)
+
+
+def test_duplicate_positional_and_keyword_raises():
+    session = FakeSession(tools=[_add_tool()])
+    with McpToolbox(make_connect(session)) as tb:
+        with pytest.raises(TypeError, match="multiple values for argument 'a'"):
+            tb.add(1, a=2)
+
+
+def test_text_json_result_is_decoded():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(text='{"hits": 7}')},
+    )
+    with McpToolbox(make_connect(session)) as tb:
+        assert tb.web_search(query="x") == {"hits": 7}
+
+
+def test_raw_text_result_returned_as_string():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(text="plain answer")},
+    )
+    with McpToolbox(make_connect(session)) as tb:
+        assert tb.web_search(query="x") == "plain answer"
+
+
+def test_snake_case_result_spelling_supported():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={"v": 1}, snake=True)},
+    )
+    with McpToolbox(make_connect(session)) as tb:
+        assert tb.web_search(query="x") == {"v": 1}
+
+
+def test_error_result_raises_mcp_tool_error():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(text="boom", error=True)},
+    )
+    with McpToolbox(make_connect(session)) as tb:
+        with pytest.raises(McpToolError, match="boom") as excinfo:
+            tb.web_search(query="x")
+        assert excinfo.value.tool == "web_search"
+
+
+def test_snake_case_error_spelling_supported():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(text="bad", error=True, snake=True)},
+    )
+    with McpToolbox(make_connect(session)) as tb:
+        with pytest.raises(McpToolError):
+            tb.web_search(query="x")
+
+
+def test_on_result_hook_shapes_value():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={"rows": [1, 2]})},
+    )
+    seen = {}
+
+    def shaper(name, value):
+        seen["name"] = name
+        return value["rows"]
+
+    with McpToolbox(make_connect(session), on_result=shaper) as tb:
+        assert tb.web_search(query="x") == [1, 2]
+        assert seen["name"] == "web_search"
+
+
+def test_on_error_hook_maps_exception():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(text="nope", error=True)},
+    )
+
+    class MyError(Exception):
+        pass
+
+    def mapper(name, result):
+        return MyError(f"{name} failed")
+
+    with McpToolbox(make_connect(session), on_error=mapper) as tb:
+        with pytest.raises(MyError, match="web_search failed"):
+            tb.web_search(query="x")

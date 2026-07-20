@@ -10,6 +10,7 @@ and `McpToolbox.stdio()` do. Install it with `pip install 'dolsot[mcp]'`.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -133,12 +134,27 @@ class McpToolbox:
         return call
 
     def _merge_args(self, name, props, args, kwargs):
-        # Argument mapping is fleshed out in Task 3; for now, keywords only.
-        return dict(kwargs)
+        if len(args) > len(props):
+            raise TypeError(
+                f"{name}() takes at most {len(props)} positional argument(s), "
+                f"got {len(args)}"
+            )
+        merged = dict(kwargs)
+        for value, key in zip(args, props):
+            if key in merged:
+                raise TypeError(f"{name}() got multiple values for argument {key!r}")
+            merged[key] = value
+        return merged
 
     def _handle_result(self, name, result):
-        # Full unwrap + hooks land in Task 3; for now, structured content only.
-        return getattr(result, "structuredContent", None)
+        if _is_error(result):
+            if self._on_error is not None:
+                raise self._on_error(name, result)
+            raise McpToolError(name, _error_text(result))
+        value = _unwrap(result)
+        if self._on_result is not None:
+            return self._on_result(name, value)
+        return value
 
     def close(self):
         if not self._started:
@@ -174,3 +190,41 @@ def _require_stdio():
     except ImportError as exc:
         raise ImportError(_INSTALL_HINT) from exc
     return stdio_client, StdioServerParameters, ClientSession
+
+
+def _is_error(result):
+    value = getattr(result, "is_error", None)
+    if value is None:
+        value = getattr(result, "isError", False)
+    return bool(value)
+
+
+def _structured(result):
+    value = getattr(result, "structured_content", None)
+    if value is None:
+        value = getattr(result, "structuredContent", None)
+    return value
+
+
+def _text(result):
+    parts = []
+    for block in getattr(result, "content", None) or []:
+        text = getattr(block, "text", None)
+        if text is not None:
+            parts.append(text)
+    return "".join(parts)
+
+
+def _unwrap(result):
+    structured = _structured(result)
+    if structured is not None:
+        return structured
+    text = _text(result)
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return text
+
+
+def _error_text(result):
+    return _text(result) or "MCP tool returned an error"
