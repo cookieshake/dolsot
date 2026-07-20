@@ -59,3 +59,14 @@ def make_connect(session):
         yield session
 
     return _connect
+
+
+def make_failing_connect(exc):
+    """Build a `connect` callable whose context manager raises `exc` on entry."""
+
+    @asynccontextmanager
+    async def _connect():
+        raise exc
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    return _connect

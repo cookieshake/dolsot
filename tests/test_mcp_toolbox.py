@@ -27,7 +27,13 @@ def test_require_stdio_guides_when_mcp_missing(monkeypatch):
         _require_stdio()
 
 
-from tests.fixtures.fake_mcp import FakeResult, FakeSession, FakeTool, make_connect
+from tests.fixtures.fake_mcp import (
+    FakeResult,
+    FakeSession,
+    FakeTool,
+    make_connect,
+    make_failing_connect,
+)
 
 from dolsot.mcp import McpToolbox
 
@@ -72,3 +78,15 @@ def test_context_manager_closes():
     )
     with McpToolbox(make_connect(session)) as tb:
         assert tb.web_search(query="x") == {"ok": True}
+    assert tb._started is False
+    assert tb._loop is None
+
+
+def test_failed_startup_leaves_no_leaked_loop_and_close_is_noop():
+    tb = McpToolbox(make_failing_connect(RuntimeError("boom")))
+    with pytest.raises(RuntimeError, match="boom"):
+        tb.web_search
+    assert tb._started is False
+    assert tb._loop is None
+    # A subsequent close() must be a safe no-op, not raise or hang.
+    tb.close()

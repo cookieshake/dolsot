@@ -89,7 +89,20 @@ class McpToolbox:
                     input_schema=tool.inputSchema or {},
                 )
 
-        self._loop.run(_startup())
+        try:
+            self._loop.run(_startup())
+        except Exception:
+            if self._stack is not None:
+                try:
+                    self._loop.run(self._stack.aclose())
+                except Exception:
+                    pass
+            self._loop.close()
+            self._loop = None
+            self._stack = None
+            self._session = None
+            self._specs = {}
+            raise
         self._started = True
 
     def __getattr__(self, name):
