@@ -21,10 +21,11 @@ class FakeResult:
 
 
 class FakeTool:
-    def __init__(self, name, description, input_schema):
+    def __init__(self, name, description, input_schema, annotations=None):
         self.name = name
         self.description = description
         self.inputSchema = input_schema
+        self.annotations = annotations
 
 
 class FakeSession:
