@@ -240,8 +240,9 @@ Policy stays with you via two optional hooks:
 
 Notes and limits: in-process backend only (not the subprocess `Repl`); transports
 are streamable-HTTP and stdio; dispatch is dynamic, so tool calls are not covered
-by the `ty` type gate; tool names `tools`, `catalog`, and `help` are shadowed by
-the toolbox's own methods.
+by the `ty` type gate. A tool whose name collides with a toolbox method
+(`tools`, `catalog`, `help`, `close`, `call`, `http`, `stdio`) is shadowed on
+attribute access, but always reachable via `nn.call("name", ...)`.
 
 ## Sessions and `SessionStore`
 
