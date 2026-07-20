@@ -34,11 +34,13 @@ class McpToolError(Exception):
 
 @dataclass
 class McpToolSpec:
-    """A discovered MCP tool: its name, description, and JSON input schema."""
+    """A discovered MCP tool: its name, description, JSON input schema, and the
+    MCP standard tool annotations (hints) when the server provides them."""
 
     name: str
     description: str
     input_schema: dict
+    annotations: object | None = None
 
 
 class _Loop:
@@ -73,10 +75,11 @@ class McpToolbox:
     that a cancel scope be exited in the task that entered it is satisfied.
     """
 
-    def __init__(self, connect, *, on_result=None, on_error=None):
+    def __init__(self, connect, *, on_result=None, on_error=None, tool_filter=None):
         self._connect = connect
         self._on_result = on_result
         self._on_error = on_error
+        self._tool_filter = tool_filter
         self._loop = None
         self._queue = None
         self._ready = None
@@ -88,7 +91,7 @@ class McpToolbox:
         self._closed = False
 
     @classmethod
-    def http(cls, url, *, token=None, headers=None, on_result=None, on_error=None):
+    def http(cls, url, *, token=None, headers=None, on_result=None, on_error=None, tool_filter=None):
         streamablehttp_client, ClientSession = _require_http()
         hdrs = dict(headers or {})
         if token:
@@ -101,10 +104,10 @@ class McpToolbox:
                     await session.initialize()
                     yield session
 
-        return cls(_connect, on_result=on_result, on_error=on_error)
+        return cls(_connect, on_result=on_result, on_error=on_error, tool_filter=tool_filter)
 
     @classmethod
-    def stdio(cls, command, args=None, *, env=None, on_result=None, on_error=None):
+    def stdio(cls, command, args=None, *, env=None, on_result=None, on_error=None, tool_filter=None):
         stdio_client, StdioServerParameters, ClientSession = _require_stdio()
         params = StdioServerParameters(command=command, args=list(args or []), env=env)
 
@@ -115,7 +118,7 @@ class McpToolbox:
                     await session.initialize()
                     yield session
 
-        return cls(_connect, on_result=on_result, on_error=on_error)
+        return cls(_connect, on_result=on_result, on_error=on_error, tool_filter=tool_filter)
 
     async def _service(self):
         # Runs entirely in ONE task on the background loop: open -> discover ->
@@ -125,11 +128,14 @@ class McpToolbox:
                 try:
                     listing = await session.list_tools()
                     for tool in listing.tools:
-                        self._specs[tool.name] = McpToolSpec(
+                        spec = McpToolSpec(
                             name=tool.name,
                             description=tool.description or "",
                             input_schema=tool.inputSchema or {},
+                            annotations=getattr(tool, "annotations", None),
                         )
+                        if self._tool_filter is None or self._tool_filter(spec):
+                            self._specs[tool.name] = spec
                 except BaseException as exc:  # noqa: BLE001
                     self._start_error = exc
                     self._ready.set()

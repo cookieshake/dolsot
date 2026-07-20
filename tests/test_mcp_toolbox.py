@@ -342,3 +342,56 @@ def test_use_after_close_raises():
     tb.close()
     with pytest.raises(RuntimeError, match="closed"):
         tb.call("web_search", query="x")
+
+
+def test_tool_filter_exposes_only_matching_tools():
+    stock_tool = FakeTool("stock_price", "Get a stock price", {"type": "object", "properties": {"ticker": {"type": "string"}}})
+    session = FakeSession(
+        tools=[_search_tool(), _add_tool(), stock_tool],
+        results={"stock_price": FakeResult(structured={"price": 42})},
+    )
+    tb = McpToolbox(make_connect(session), tool_filter=lambda s: s.name.startswith("stock_"))
+    try:
+        assert [spec.name for spec in tb.tools()] == ["stock_price"]
+        assert "stock_price" in tb.catalog()
+        assert "web_search" not in tb.catalog()
+        assert tb.stock_price(ticker="X") == {"price": 42}
+    finally:
+        tb.close()
+
+
+def test_filtered_out_tool_is_not_accessible():
+    session = FakeSession(tools=[_search_tool(), _add_tool()])
+    tb = McpToolbox(make_connect(session), tool_filter=lambda s: s.name == "add")
+    try:
+        with pytest.raises(AttributeError, match="no tool named 'web_search'"):
+            tb.web_search
+        with pytest.raises(AttributeError, match="no tool named 'web_search'"):
+            tb.call("web_search", query="x")
+    finally:
+        tb.close()
+
+
+def test_none_filter_exposes_all_tools():
+    session = FakeSession(tools=[_search_tool(), _add_tool()])
+    with McpToolbox(make_connect(session)) as tb:
+        assert {spec.name for spec in tb.tools()} == {"web_search", "add"}
+
+
+def test_predicate_receives_annotations():
+    seen = {}
+    annotated = FakeTool(
+        "readonly_tool",
+        "A read-only tool",
+        {"type": "object", "properties": {}},
+        annotations={"readOnlyHint": True},
+    )
+    session = FakeSession(tools=[annotated])
+
+    def keep_readonly(spec):
+        seen[spec.name] = spec.annotations
+        return bool(spec.annotations and spec.annotations.get("readOnlyHint"))
+
+    with McpToolbox(make_connect(session), tool_filter=keep_readonly) as tb:
+        assert [spec.name for spec in tb.tools()] == ["readonly_tool"]
+    assert seen["readonly_tool"] == {"readOnlyHint": True}
