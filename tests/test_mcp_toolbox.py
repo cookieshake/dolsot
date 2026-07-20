@@ -25,3 +25,50 @@ def test_require_stdio_guides_when_mcp_missing(monkeypatch):
     monkeypatch.setitem(sys.modules, "mcp", None)
     with pytest.raises(ImportError, match=r"dolsot\[mcp\]"):
         _require_stdio()
+
+
+from tests.fixtures.fake_mcp import FakeResult, FakeSession, FakeTool, make_connect
+
+from dolsot.mcp import McpToolbox
+
+
+def _search_tool():
+    return FakeTool(
+        "web_search",
+        "Search the web",
+        {"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+
+
+def test_discovers_and_calls_tool_returning_structured_content():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={"hits": 3})},
+    )
+    tb = McpToolbox(make_connect(session))
+    try:
+        out = tb.web_search(query="dolsot")
+        assert out == {"hits": 3}
+        assert session.initialized is True
+        assert session.calls == [("web_search", {"query": "dolsot"})]
+    finally:
+        tb.close()
+
+
+def test_unknown_tool_raises_attribute_error():
+    session = FakeSession(tools=[_search_tool()])
+    tb = McpToolbox(make_connect(session))
+    try:
+        with pytest.raises(AttributeError, match="no tool named 'nope'"):
+            tb.nope
+    finally:
+        tb.close()
+
+
+def test_context_manager_closes():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={"ok": True})},
+    )
+    with McpToolbox(make_connect(session)) as tb:
+        assert tb.web_search(query="x") == {"ok": True}
