@@ -47,7 +47,9 @@ class FakeSession:
         self.calls.append((name, arguments))
         result = self._results.get(name)
         if callable(result):
-            return result(arguments)
+            result = result(arguments)
+        if isinstance(result, BaseException):
+            raise result
         return result
 
 
@@ -60,6 +62,34 @@ def make_connect(session):
         yield session
 
     return _connect
+
+
+def make_connect_sequence(sessions, opened=None, exit_error=None):
+    """Build a `connect` callable that yields a fresh session per connection.
+
+    `sessions` items may be FakeSession instances (yielded) or exceptions
+    (raised on entry, simulating a failed reconnect). Every entered session is
+    appended to `opened`, so tests can count reconnections. When `exit_error` is
+    set, leaving the context manager raises it — like a dead transport whose
+    teardown also fails.
+    """
+    remaining = list(sessions)
+    opened = [] if opened is None else opened
+
+    @asynccontextmanager
+    async def _connect():
+        if not remaining:
+            raise AssertionError("connect called more times than the test expected")
+        session = remaining.pop(0)
+        if isinstance(session, BaseException):
+            raise session
+        await session.initialize()
+        opened.append(session)
+        yield session
+        if exit_error is not None:
+            raise exit_error
+
+    return _connect, opened
 
 
 def make_failing_connect(exc):

@@ -231,6 +231,14 @@ session = InProcessSession(inject={"nn": nn})
 nn.close()  # or use `with McpToolbox.http(...) as nn:`
 ```
 
+The session is self-healing: a toolbox is meant to be created once and kept for
+the life of a long-running host. If the server drops or expires the session (an
+idle streamable-HTTP session answering `404`, a transport that went away), the
+next call reconnects and is retried once on the fresh session — no `close()` and
+rebuild needed. Retries only cover transport-level failures between requests, so
+a tool that actually ran never runs twice: errors the server reports for a tool
+(`isError`) and well-formed protocol errors are raised as-is.
+
 Policy stays with you via two optional hooks:
 
 - `on_result(tool_name, value)` — post-process each result (e.g. turn a

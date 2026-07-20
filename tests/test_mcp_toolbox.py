@@ -32,6 +32,7 @@ from tests.fixtures.fake_mcp import (
     FakeSession,
     FakeTool,
     make_connect,
+    make_connect_sequence,
     make_failing_connect,
 )
 
@@ -376,6 +377,134 @@ def test_none_filter_exposes_all_tools():
     session = FakeSession(tools=[_search_tool(), _add_tool()])
     with McpToolbox(make_connect(session)) as tb:
         assert {spec.name for spec in tb.tools()} == {"web_search", "add"}
+
+
+class _FakeMcpError(Exception):
+    """Stands in for mcp.shared.exceptions.McpError: a well-formed JSON-RPC
+    error response, which proves the session is alive."""
+
+
+_FakeMcpError.__name__ = "McpError"
+
+
+def test_transport_failure_reconnects_and_retries_the_call():
+    dead = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": ConnectionError("session expired")},
+    )
+    fresh = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={"ok": True})},
+    )
+    connect, opened = make_connect_sequence([dead, fresh])
+    with McpToolbox(connect) as tb:
+        assert tb.web_search(query="x") == {"ok": True}
+    assert opened == [dead, fresh]  # reconnected exactly once
+    assert fresh.calls == [("web_search", {"query": "x"})]
+
+
+def test_application_error_is_not_retried():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(text="boom", error=True)},
+    )
+    connect, opened = make_connect_sequence([session])
+    with McpToolbox(connect) as tb:
+        with pytest.raises(McpToolError, match="boom"):
+            tb.web_search(query="x")
+    assert len(opened) == 1  # no reconnect
+    assert len(session.calls) == 1  # no duplicate side effect
+
+
+def test_protocol_error_response_is_not_retried():
+    session = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": _FakeMcpError("invalid params")},
+    )
+    connect, opened = make_connect_sequence([session])
+    with McpToolbox(connect) as tb:
+        with pytest.raises(_FakeMcpError):
+            tb.web_search(query="x")
+    assert len(opened) == 1
+    assert len(session.calls) == 1
+
+
+def test_retry_is_attempted_only_once():
+    first = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": ConnectionError("expired")},
+    )
+    second = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": ConnectionError("still expired")},
+    )
+    connect, opened = make_connect_sequence([first, second])
+    with McpToolbox(connect) as tb:
+        with pytest.raises(ConnectionError, match="still expired"):
+            tb.web_search(query="x")
+    assert opened == [first, second]
+
+
+def test_failed_reconnect_surfaces_and_the_next_call_recovers():
+    dead = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": ConnectionError("expired")},
+    )
+    fresh = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={"ok": True})},
+    )
+    connect, opened = make_connect_sequence([dead, ConnectionError("server down"), fresh])
+    with McpToolbox(connect) as tb:
+        with pytest.raises(ConnectionError, match="server down"):
+            tb.web_search(query="x")
+        assert tb.web_search(query="x") == {"ok": True}
+    assert opened == [dead, fresh]
+
+
+def test_close_after_a_failed_reconnect_does_not_hang():
+    dead = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": ConnectionError("expired")},
+    )
+    connect, _ = make_connect_sequence([dead, ConnectionError("server down")])
+    tb = McpToolbox(connect)
+    with pytest.raises(ConnectionError, match="server down"):
+        tb.web_search(query="x")
+    tb.close()  # service is idling without a session; must still shut down
+    assert tb._loop is None
+
+
+def test_teardown_error_on_the_dead_session_does_not_lose_the_retry():
+    dead = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": ConnectionError("expired")},
+    )
+    fresh = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={"ok": True})},
+    )
+    connect, opened = make_connect_sequence(
+        [dead, fresh], exit_error=RuntimeError("transport already closed")
+    )
+    with McpToolbox(connect) as tb:  # close() must survive the failing teardown
+        assert tb.web_search(query="x") == {"ok": True}
+    assert opened == [dead, fresh]
+
+
+def test_reconnect_survives_a_transport_error_group():
+    dead = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": ExceptionGroup("transport", [ConnectionError("expired")])},
+    )
+    fresh = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={"ok": True})},
+    )
+    connect, opened = make_connect_sequence([dead, fresh])
+    with McpToolbox(connect) as tb:
+        assert tb.web_search(query="x") == {"ok": True}
+    assert opened == [dead, fresh]
 
 
 def test_predicate_receives_annotations():

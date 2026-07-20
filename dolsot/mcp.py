@@ -122,45 +122,93 @@ class McpToolbox:
 
     async def _service(self):
         # Runs entirely in ONE task on the background loop: open -> discover ->
-        # serve queue -> close. Enter and exit of the connection happen here.
+        # serve queue -> close, reopening whenever the session dies under us.
+        # Enter and exit of every connection happen here, in this one task.
+        pending = None  # a call to replay on the next session after a reconnect
         try:
-            async with self._connect() as session:
+            while True:
+                teardown = False
                 try:
-                    listing = await session.list_tools()
-                    for tool in listing.tools:
-                        spec = McpToolSpec(
-                            name=tool.name,
-                            description=tool.description or "",
-                            input_schema=tool.inputSchema or {},
-                            annotations=getattr(tool, "annotations", None),
-                        )
-                        if self._tool_filter is None or self._tool_filter(spec):
-                            self._specs[tool.name] = spec
+                    async with self._connect() as session:
+                        if not self._ready.is_set():
+                            try:
+                                await self._discover(session)
+                            except BaseException as exc:  # noqa: BLE001
+                                self._start_error = exc
+                                self._ready.set()
+                                return  # exits the async-with in THIS task
+                            self._ready.set()
+                        pending = await self._serve(session, pending)
+                        teardown = True  # past here, errors are teardown noise
+                    if pending is None:
+                        return  # shutdown requested
                 except BaseException as exc:  # noqa: BLE001
-                    self._start_error = exc
-                    self._ready.set()
-                    return  # exits the async-with in THIS task, closing session
-                self._ready.set()
-                while True:
-                    item = await self._queue.get()
-                    if item is _SHUTDOWN:
-                        break
-                    name, arguments, fut = item
-                    try:
-                        result = await session.call_tool(name, arguments)
-                    except BaseException as exc:  # noqa: BLE001
+                    if self._ready is not None and not self._ready.is_set():
+                        # The very first connection could not be opened.
+                        self._start_error = exc
+                        self._ready.set()
+                        return
+                    if teardown:
+                        # Closing a session that just died often fails too; that
+                        # must not cost us the retry (or stall the shutdown).
+                        if pending is None:
+                            return
+                        continue
+                    # The (re)connect itself failed. Surface it to the caller
+                    # whose call triggered it, then idle until the next request
+                    # rather than spinning on a server that is down.
+                    if pending is not None:
+                        _, _, fut = pending
+                        pending = None
                         if not fut.done():
                             fut.set_exception(exc)
-                    else:
-                        if not fut.done():
-                            fut.set_result(result)
-        except BaseException as exc:  # noqa: BLE001
-            # Connection could not be opened (or an error escaped after open).
-            if self._ready is not None and not self._ready.is_set():
-                self._start_error = exc
-                self._ready.set()
+                    item = await self._queue.get()
+                    if item is _SHUTDOWN:
+                        return
+                    pending = item
         finally:
             self._fail_pending()
+
+    async def _discover(self, session):
+        listing = await session.list_tools()
+        for tool in listing.tools:
+            spec = McpToolSpec(
+                name=tool.name,
+                description=tool.description or "",
+                input_schema=tool.inputSchema or {},
+                annotations=getattr(tool, "annotations", None),
+            )
+            if self._tool_filter is None or self._tool_filter(spec):
+                self._specs[tool.name] = spec
+
+    async def _serve(self, session, pending):
+        """Serve queued calls on `session`.
+
+        Returns None when shutdown was requested, or the item that must be
+        replayed on a fresh session because this one died mid-call. `pending`
+        is such a replay: it gets exactly one attempt, so a request is never
+        sent to the server more than twice.
+        """
+        retrying = pending is not None
+        while True:
+            if pending is not None:
+                item, pending = pending, None
+            else:
+                item = await self._queue.get()
+                retrying = False
+            if item is _SHUTDOWN:
+                return None
+            name, arguments, fut = item
+            try:
+                result = await session.call_tool(name, arguments)
+            except BaseException as exc:  # noqa: BLE001
+                if not retrying and _is_transport_error(exc):
+                    return item
+                if not fut.done():
+                    fut.set_exception(exc)
+            else:
+                if not fut.done():
+                    fut.set_result(result)
 
     def _fail_pending(self):
         # Fail any still-queued requests so callers never hang after shutdown.
@@ -338,6 +386,22 @@ def _require_stdio():
     except ImportError as exc:
         raise ImportError(_INSTALL_HINT) from exc
     return stdio_client, StdioServerParameters, ClientSession
+
+
+def _is_transport_error(exc):
+    """True when a failed `call_tool` means the session/transport is gone.
+
+    An MCP server reports tool failures as results with `isError` set, so an
+    exception out of `call_tool` is a protocol- or transport-level problem. The
+    exception is `McpError`: a well-formed JSON-RPC error response, which proves
+    the session is alive and the request already reached the server — replaying
+    it would be pointless at best and a duplicate side effect at worst.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_transport_error(inner) for inner in exc.exceptions)
+    if not isinstance(exc, Exception):
+        return False  # CancelledError, KeyboardInterrupt, ...
+    return not any(base.__name__ == "McpError" for base in type(exc).__mro__)
 
 
 def _is_error(result):
