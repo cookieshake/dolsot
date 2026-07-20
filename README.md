@@ -207,6 +207,43 @@ def help(topic: str | None = None) -> str:
     return "mytools cheat-sheet"
 ```
 
+## MCP toolbox (optional)
+
+`dolsot.mcp.McpToolbox` wraps an MCP server so its tools become synchronous
+callables inside an `InProcessSession`. It is an optional feature:
+
+    pip install 'dolsot[mcp]'
+
+```python
+from dolsot import InProcessSession
+from dolsot.mcp import McpToolbox
+
+# Remote server over streamable HTTP:
+nn = McpToolbox.http(url="https://example/mcp", token="…")
+
+# Or a locally spawned server over stdio:
+# nn = McpToolbox.stdio(command="npx", args=["-y", "server-filesystem", "/data"])
+
+session = InProcessSession(inject={"nn": nn})
+# In a cell, the agent calls tools synchronously, positionally or by keyword:
+#   nn.web_search(query="…")
+# Introspect what's available with nn.catalog() / nn.help().
+nn.close()  # or use `with McpToolbox.http(...) as nn:`
+```
+
+Policy stays with you via two optional hooks:
+
+- `on_result(tool_name, value)` — post-process each result (e.g. turn a
+  `{"rows": [...]}` payload into a DataFrame).
+- `on_error(tool_name, result)` — return the exception to raise when a tool
+  reports an error (defaults to `dolsot.mcp.McpToolError`).
+
+Notes and limits: in-process backend only (not the subprocess `Repl`); transports
+are streamable-HTTP and stdio; dispatch is dynamic, so tool calls are not covered
+by the `ty` type gate. A tool whose name collides with a toolbox method
+(`tools`, `catalog`, `help`, `close`, `call`, `http`, `stdio`) is shadowed on
+attribute access, but always reachable via `nn.call("name", ...)`.
+
 ## Sessions and `SessionStore`
 
 A session is opaque bytes to dolsot — the worker process owns pickling (via
