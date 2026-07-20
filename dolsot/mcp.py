@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 
 _INSTALL_HINT = (
@@ -73,6 +73,36 @@ class McpToolbox:
         self._specs = {}
         self._bound = {}
         self._started = False
+
+    @classmethod
+    def http(cls, url, *, token=None, headers=None, on_result=None, on_error=None):
+        streamablehttp_client, ClientSession = _require_http()
+        hdrs = dict(headers or {})
+        if token:
+            hdrs["Authorization"] = f"Bearer {token}"
+
+        @asynccontextmanager
+        async def _connect():
+            async with streamablehttp_client(url, headers=hdrs or None) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    yield session
+
+        return cls(_connect, on_result=on_result, on_error=on_error)
+
+    @classmethod
+    def stdio(cls, command, args=None, *, env=None, on_result=None, on_error=None):
+        stdio_client, StdioServerParameters, ClientSession = _require_stdio()
+        params = StdioServerParameters(command=command, args=list(args or []), env=env)
+
+        @asynccontextmanager
+        async def _connect():
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    yield session
+
+        return cls(_connect, on_result=on_result, on_error=on_error)
 
     def _ensure_started(self):
         if self._started:

@@ -2,7 +2,7 @@ import sys
 
 import pytest
 
-from dolsot.mcp import McpToolError, McpToolSpec, _require_http, _require_stdio
+from dolsot.mcp import McpToolError, McpToolSpec, _Loop, _require_http, _require_stdio
 
 
 def test_mcp_module_imports_and_exposes_symbols():
@@ -227,3 +227,46 @@ def test_help_matches_catalog():
     session = FakeSession(tools=[_search_tool()])
     with McpToolbox(make_connect(session)) as tb:
         assert tb.help() == tb.catalog()
+
+
+def test_http_constructs_lazily_without_connecting():
+    tb = McpToolbox.http(url="http://example/mcp", token="secret")
+    assert isinstance(tb, McpToolbox)
+    assert tb._started is False
+    assert tb._loop is None
+
+
+def test_stdio_constructs_lazily_without_connecting():
+    tb = McpToolbox.stdio(command="true", args=["--flag"])
+    assert isinstance(tb, McpToolbox)
+    assert tb._started is False
+    assert tb._loop is None
+
+
+def test_http_merges_bearer_token_into_headers(monkeypatch):
+    captured = {}
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def fake_streamable(url, headers=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        raise AssertionError("should not actually connect in this test")
+        yield  # pragma: no cover
+
+    # Patch the resolver so .http builds its connect from our fake.
+    monkeypatch.setattr(
+        "dolsot.mcp._require_http",
+        lambda: (fake_streamable, object),
+    )
+    tb = McpToolbox.http(url="http://example/mcp", token="secret", headers={"X-A": "1"})
+    # Drive the connect callable far enough to capture the headers it would use.
+    with pytest.raises(AssertionError):
+        tb._loop = _Loop()
+        try:
+            tb._loop.run(tb._connect().__aenter__())
+        finally:
+            tb._loop.close()
+            tb._loop = None
+    assert captured["headers"] == {"X-A": "1", "Authorization": "Bearer secret"}
