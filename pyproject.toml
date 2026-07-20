@@ -23,6 +23,9 @@ dependencies = ["dill>=0.3.8"]
 # REPL still runs. Install `dolsot[typecheck]` to get pre-execution type checking.
 [project.optional-dependencies]
 typecheck = ["ty>=0.0.1a1"]
+# The MCP toolbox (`dolsot.mcp`) is optional: importing the module works without
+# this extra, but `McpToolbox.http()` / `.stdio()` require the `mcp` SDK.
+mcp = ["mcp>=1.0"]
 
 [project.urls]
 Homepage = "https://github.com/cookieshake/dolsot"
@@ -33,7 +36,7 @@ Issues = "https://github.com/cookieshake/dolsot/issues"
 dolsot = "dolsot.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "ty>=0.0.1a1"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ty>=0.0.1a1", "mcp>=1.0"]
 
 [build-system]
 requires = ["hatchling"]
