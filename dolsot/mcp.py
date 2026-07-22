@@ -388,20 +388,38 @@ def _require_stdio():
     return stdio_client, StdioServerParameters, ClientSession
 
 
+# The streamable-HTTP client does not raise when the server rejects a request
+# with 404 (the session expired). It synthesizes a JSON-RPC error carrying this
+# code instead, so the death of the session reaches us disguised as McpError.
+_SESSION_TERMINATED_CODE = 32600
+
+
 def _is_transport_error(exc):
     """True when a failed `call_tool` means the session/transport is gone.
 
     An MCP server reports tool failures as results with `isError` set, so an
-    exception out of `call_tool` is a protocol- or transport-level problem. The
-    exception is `McpError`: a well-formed JSON-RPC error response, which proves
-    the session is alive and the request already reached the server — replaying
-    it would be pointless at best and a duplicate side effect at worst.
+    exception out of `call_tool` is a protocol- or transport-level problem.
+    `McpError` is normally the protocol case: a well-formed JSON-RPC error
+    response, which proves the session is alive and the request already reached
+    the server — replaying it would be pointless at best and a duplicate side
+    effect at worst. The exception is an expired session, which the transport
+    reports as an McpError even though nothing reached the server; that one must
+    reconnect, or every later call keeps hitting the same dead session.
     """
     if isinstance(exc, BaseExceptionGroup):
         return any(_is_transport_error(inner) for inner in exc.exceptions)
     if not isinstance(exc, Exception):
         return False  # CancelledError, KeyboardInterrupt, ...
-    return not any(base.__name__ == "McpError" for base in type(exc).__mro__)
+    if not any(base.__name__ == "McpError" for base in type(exc).__mro__):
+        return True
+    return _is_session_terminated(exc)
+
+
+def _is_session_terminated(exc):
+    error = getattr(exc, "error", None)
+    if getattr(error, "code", None) == _SESSION_TERMINATED_CODE:
+        return True
+    return "session terminated" in str(exc).lower()
 
 
 def _is_error(result):

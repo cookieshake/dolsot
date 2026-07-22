@@ -387,6 +387,26 @@ class _FakeMcpError(Exception):
 _FakeMcpError.__name__ = "McpError"
 
 
+class _FakeErrorData:
+    """Stands in for mcp.types.ErrorData, carried on McpError.error."""
+
+    def __init__(self, code, message):
+        self.code = code
+        self.message = message
+
+
+def _session_terminated_error():
+    """The exception a real streamable-HTTP session raises once it has expired.
+
+    The SDK turns the server's 404 into a JSON-RPC error (code 32600,
+    "Session terminated") rather than a transport exception, so what reaches
+    `call_tool` is an McpError even though the session is unusable.
+    """
+    exc = _FakeMcpError("Session terminated")
+    exc.error = _FakeErrorData(32600, "Session terminated")
+    return exc
+
+
 def test_transport_failure_reconnects_and_retries_the_call():
     dead = FakeSession(
         tools=[_search_tool()],
@@ -443,6 +463,40 @@ def test_retry_is_attempted_only_once():
         with pytest.raises(ConnectionError, match="still expired"):
             tb.web_search(query="x")
     assert opened == [first, second]
+
+
+def test_expired_session_reconnects_and_retries_the_call():
+    dead = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": _session_terminated_error()},
+    )
+    fresh = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": FakeResult(structured={"ok": True})},
+    )
+    connect, opened = make_connect_sequence([dead, fresh])
+    with McpToolbox(connect) as tb:
+        assert tb.web_search(query="x") == {"ok": True}
+    assert opened == [dead, fresh]  # reconnected exactly once
+    assert fresh.calls == [("web_search", {"query": "x"})]
+
+
+def test_expired_session_retry_is_attempted_only_once():
+    first = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": _session_terminated_error()},
+    )
+    second = FakeSession(
+        tools=[_search_tool()],
+        results={"web_search": _session_terminated_error()},
+    )
+    connect, opened = make_connect_sequence([first, second])
+    with McpToolbox(connect) as tb:
+        with pytest.raises(_FakeMcpError, match="Session terminated"):
+            tb.web_search(query="x")
+    assert opened == [first, second]  # no third attempt
+    assert len(first.calls) == 1
+    assert len(second.calls) == 1
 
 
 def test_failed_reconnect_surfaces_and_the_next_call_recovers():
