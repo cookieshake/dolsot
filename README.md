@@ -1,341 +1,128 @@
-# dolsot
+# dolsot 1.0 alpha
 
-A toolbox-agnostic, **stateful** Python REPL engine for LLM agents.
+`dolsot` runs JavaScript cells in a `quickjs-wasi` child process hosted by Node.js. This repository is the Node.js 1.0 line; the Python 0.x source remains available on the `v0` branch and `v0.4.2` tag. This alpha package is private and is not published to npm.
 
-You inject a "toolbox" — any importable Python module — into a namespace, then
-run cells of Python against it. Each cell can read and rebind whatever the
-previous cell left behind, keyed by a session id: variables, DataFrames,
-functions, imports.
+## Requirements and local setup
 
-## Backends
+Node.js 24 or newer is required. From the repository root:
 
-dolsot ships two ways to run a cell, and the choice is a real trade-off
-between isolation and what you can inject.
-
-**Subprocess backend (`Repl`)** — the default, and what the rest of this
-README describes. Toolboxes are importable, stateless modules referenced by
-name; dolsot itself never imports or knows anything about a toolbox, it only
-ever handles a module *name*, because only a name can cross into the child
-worker. Sessions are persistent across calls, and each cell runs in its own
-worker process, so a timeout is enforced by hard-killing that process
-(`SIGKILL`) — a runaway cell cannot take the host down, and the worker is
-fully isolated from the host's live objects and memory. That process
-boundary is also the cost: state must be pickled between cells, and a live
-object (a socket, a lock, an open connection) cannot cross it.
-
-**In-process backend (`InProcessSession`)** — runs cells directly in the
-host process against a live namespace dict, with no process boundary. This
-lets you inject live objects as-is — a database connection, a client, a
-generator — and state persists across cells by reference, not by pickling.
-It is **less isolated** than `Repl`: there is no worker to kill, so a
-per-call timeout is **cooperative only** — a cell that ignores it keeps
-running on a leaked daemon thread that cannot be forcibly stopped. An
-optional caller-supplied AST gate (`dolsot.sandbox.check_ast`, or your own)
-can reject dangerous constructs before a cell runs, but dolsot provides that
-gate as a mechanism, not a safety guarantee; in-process CPython sandboxing is
-inherently leaky. Use it only for code and toolboxes you already trust to
-run unsandboxed.
-
-State crosses between `Repl` cells by being **pickled to disk** (via `dill`) and
-reloaded in the next cell's fresh worker process — so what persists is exactly
-what `dill` can serialize. A **live object** — an open database connection, a
-socket, a file handle, a generator, a lock — cannot cross that boundary. Such a
-value is *dropped* (best-effort, so one of them never sinks the rest of the
-session), reported on `Result.dropped`, and gone on the next call. If your work
-needs a connection to live across cells, re-open it at the top of each cell.
-
-**dolsot is not a sandbox.** Every cell runs in a child worker process, and
-that process is killed if it runs past its timeout — that protects the host
-from a hung or runaway cell, nothing more. The worker has full filesystem,
-network, and process access, exactly like the toolbox code it runs. Only
-inject toolboxes, and only run code, that you'd trust to run unsandboxed.
-
-## Install
-
-```bash
-uv add dolsot                # core: the REPL engine
-uv add "dolsot[typecheck]"   # + the ty type gate (optional)
+```sh
+npm ci
 ```
 
-The only hard runtime dependency is `dill` (session pickling). The type gate is
-powered by `ty`, pulled in by the `typecheck` extra; without it the gate fails
-open (a no-op) and the REPL still runs. Requires Python >= 3.11 on a **POSIX
-platform** — the worker timeout kills a process group with `SIGKILL`, so Windows
-is not supported.
+Run a cell with the local CLI:
 
-## Library usage
-
-```python
-import mytools  # your toolbox module
-from dolsot import Repl
-
-repl = Repl(inject={"mt": mytools})
-
-r = repl.run("task-42", "mt.add(1, 2)")
-print(r.value)   # "3"
-
-# state from the previous cell is still there
-r = repl.run("task-42", "df = mt.load('orders')")
-r = repl.run("task-42", "len(df)")
-print(r.value)
+```sh
+node src/cli.mjs --session work 'var total = 40; total += 2; total'
 ```
 
-`inject` maps the alias code will use (`mt`) to either a module object or an
-importable module name (`"mytools"`) — a module object is resolved to its
-`__name__` and re-imported inside the worker, since only something importable
-by name can cross the process boundary.
+With no `DOLSOT_SESSION_DIR`, session snapshots live only in that host process. A one-shot CLI process exits after one cell, so its in-memory session does not carry into a later CLI process. To continue a session across separate CLI invocations, choose a dedicated absolute directory:
 
-An `async` twin, `arun`, exists for event-loop hosts:
-
-```python
-r = await repl.arun("task-42", "mt.add(1, 2)")
+```sh
+export DOLSOT_SESSION_DIR="$HOME/.local/state/dolsot"
+node src/cli.mjs --session work 'var total = 40; total += 2; total'
+node src/cli.mjs --session work 'total += 1; total'
 ```
 
-### `Result`
+The second invocation restores the disk snapshot and returns `43`. The directory stores version-tagged snapshots and uses atomic replacement and cross-process locking. The internal `2.0.0-alpha.0` snapshot compatibility marker is retained so existing Node alpha snapshots remain readable; it is separate from the npm/MCP product version. A malformed, oversized, or incompatible snapshot fails explicitly; it is not silently replaced with an empty session. `--reset all` fences off earlier in-flight cells so they cannot recreate state after reset. The local host limits stored sessions to 256.
 
-Every call returns a `Result`, never raises for a user-code failure:
+Standard input, listing, and reset:
 
-| field | meaning |
-|---|---|
-| `ok` | `True` if the cell ran without raising |
-| `value` | the trailing expression's value, stringified, or `None` |
-| `stdout` | anything the cell printed |
-| `error` | the error message, or `None` |
-| `exit_code` | `0` on success; see below otherwise |
-| `held` | names now persisted in the session (variables, imports, functions) |
-| `dropped` | names the cell computed but could not persist — unpicklable live objects (a connection, socket, generator, lock). Gone next call; not a failure |
-| `text` | `stdout` + `value` + `error` + the held-names banner, pre-joined |
-
-`exit_code` is:
-- `0` — the cell ran and returned normally.
-- an `int` your toolbox exception carries as `.exit_code` — a toolbox can
-  signal its own failure classes this way (e.g. "not found" vs. "bad input").
-- `1` — any other unhandled exception, or a worker-side failure (session
-  wouldn't load, type gate failed, etc.).
-- `124` — the cell was killed for exceeding its timeout.
-
-`Repl.run`/`arun` raise only for a *caller* mistake, before any code runs:
-`InvalidSession` (bad session id, or empty code) and `InvalidToolbox` (an
-`inject` value that isn't a module or module name).
-
-### Session housekeeping
-
-```python
-repl.sessions()      # -> list[SessionInfo] (id, size_bytes, last_used)
-repl.reset("task-42")  # forget one session
-repl.reset("all")       # forget every session in the configured store
+```sh
+printf 'var message = "hello"; message.toUpperCase()\n' | node src/cli.mjs --session work
+node src/cli.mjs --list-sessions
+node src/cli.mjs --reset work
+node src/cli.mjs --reset all
 ```
 
-## CLI usage
+`--timeout` accepts seconds. Normal completion returns exit code 0, a cell error 1, a usage error 2, and a hard timeout 124. `print()` and `console.log()` write to stdout; the trailing cell value is printed afterward. Display output is capped at 1 MiB. A host allows at most four active QuickJS workers, 64 queued workers, and 16 active host toolbox handlers; each guest is configured with a 32 MiB QuickJS memory limit and 256 KiB stack limit. These are per-host interpreter limits, not OS-level RSS isolation or a machine-wide process quota.
 
-Installing dolsot also installs the `dolsot` command — the shape pi (or any
-agent host) spawns as a subprocess. It is a thin shell over `Repl`: parse
-arguments, run one cell, print, exit with `Result.exit_code`.
+## JavaScript toolboxes
 
-```bash
-# run code given as an argument
-dolsot --toolbox mytools:mt --session work "mt.add(1, 2)"
+A toolbox is a trusted Node.js module loaded by the host. Export `tools` as a map of names to descriptions, JSON input schemas, and handlers. The module is not executed inside QuickJS; only the declared API is bridged into the guest.
 
-# or piped in on stdin
-echo "2 ** 10" | dolsot --toolbox mytools:mt --session work
-
-# multiple toolboxes, repeatable
-dolsot --toolbox mytools:mt --toolbox otherlib:ol --session work "mt.add(1, ol.scale(2))"
-
-# a session works fine with no toolbox at all
-dolsot --session scratch "1 + 1"
-
-# session management
-dolsot --list-sessions
-dolsot --reset work
-dolsot --reset all
-
-# per-call timeout override (seconds)
-dolsot --toolbox mytools:mt --session work --timeout 5 "slow_call()"
+```sh
+node src/cli.mjs --session work --toolbox "$PWD/examples/math-tools.mjs:mt" 'await mt.add({a: 1, b: 2})'
 ```
 
-`--toolbox MODULE:ALIAS` may be repeated; it is not required to run code —
-a session with no toolbox still runs plain Python. A malformed spec (missing
-`:`, or an empty module/alias) is a usage error.
+The guest also has `mt.catalog()`, `mt.help()`, and `mt.call(name, arguments)`. If a toolbox exports a tool named `catalog`, that tool owns `mt.catalog()` and the static metadata remains available through `mt.help()`. Calls are asynchronous and need `await`. A cell that finishes while one of its host tool calls is still pending fails without saving the new snapshot and aborts the host request; handlers should honor the supplied `{ signal }` context. Abort cannot undo an external side effect already performed. Host modules have the Node process's authority and should be trusted. QuickJS guest code does not receive `process`, `require`, Node built-ins, npm packages, filesystem, or network access directly.
 
-`--session` is required for running code — not for `--list-sessions` or
-`--reset`. Without it dolsot exits `2` and explains why: state (variables,
-imports, DataFrames) persists per session id, so a stable id per task is
-what makes that useful.
+## Connecting external MCP tools
 
-### Output contract
+Set `DOLSOT_MCP_CONFIG` to a JSON file. Only the host reads it. HTTP header and stdio environment values are named through environment-variable references so their values are not copied into guest code.
 
-This split is deliberate and stable, because callers parse it:
-
-| stream | content |
-|---|---|
-| stdout | the cell's captured `stdout`, then the trailing expression's `value` |
-| stderr | the error line, the "session now holds" banner, any save warning |
-| exit code | `Result.exit_code` (see the table above), or `2` for a CLI usage error |
-
-## The toolbox contract
-
-A toolbox is just an importable Python module — dolsot places no import-time
-requirements on it — but a few conventions make it far more usable by an
-agent driving it through a REPL:
-
-| convention | why |
-|---|---|
-| importable by name (`import mytools` works in the worker) | only a module *name* crosses the host/worker boundary; a live object can't |
-| `__all__` | declares the public surface dolsot's error hints and the type gate reflect over; without it, every non-underscore attribute is public |
-| an exception with an `int` `.exit_code` | lets a toolbox signal its own failure classes through the process exit code, instead of everything collapsing to `1` |
-| a `help()` callable | dolsot's argument-count hints point the agent at `mt.help("fn_name")` when a call fails, so it's worth having one |
-| real type annotations | the type gate (`ty`) type-checks a cell against the toolbox's own signatures *before* running it, turning a wrong-arguments call into a fixable diagnostic instead of a raw traceback |
-
-Example toolbox shape:
-
-```python
-# mytools/__init__.py
-__all__ = ["add", "load", "help", "ToolError"]
-
-class ToolError(Exception):
-    exit_code = 3
-
-def add(a: int, b: int) -> int:
-    """Add two ints."""
-    return a + b
-
-def load(name: str) -> list[int]:
-    ...
-
-def help(topic: str | None = None) -> str:
-    return "mytools cheat-sheet"
+```json
+{
+  "servers": [
+    {
+      "id": "docs",
+      "transport": "http",
+      "url": "https://mcp.example.invalid/mcp",
+      "headerEnv": { "Authorization": "DOCS_MCP_AUTHORIZATION" },
+      "allowedTools": ["search_documents"]
+    },
+    {
+      "id": "local-tools",
+      "transport": "stdio",
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/server.mjs"],
+      "envFrom": { "API_TOKEN": "TOOLS_API_TOKEN" }
+    }
+  ]
+}
 ```
 
-## MCP toolbox (optional)
+With the config and referenced environment variables set, the JavaScript toolbox exposes search, catalog, refresh, and call:
 
-`dolsot.mcp.McpToolbox` wraps an MCP server so its tools become synchronous
-callables inside an `InProcessSession`. It is an optional feature:
-
-    pip install 'dolsot[mcp]'
-
-```python
-from dolsot import InProcessSession
-from dolsot.mcp import McpToolbox
-
-# Remote server over streamable HTTP:
-nn = McpToolbox.http(url="https://example/mcp", token="…")
-
-# Or a locally spawned server over stdio:
-# nn = McpToolbox.stdio(command="npx", args=["-y", "server-filesystem", "/data"])
-
-session = InProcessSession(inject={"nn": nn})
-# In a cell, the agent calls tools synchronously, positionally or by keyword:
-#   nn.web_search(query="…")
-# Introspect what's available with nn.catalog() / nn.help().
-nn.close()  # or use `with McpToolbox.http(...) as nn:`
+```js
+var hits = await mcp.search({ query: '회의록 검색', limit: 5 });
+var first = hits.tools[0];
+await mcp.call({
+  serverId: first.serverId,
+  toolName: first.toolName,
+  arguments: { query: '지난 회의' },
+  expectedToolRevision: first.toolRevision
+});
+await mcp.refresh();
+await mcp.refresh({ serverId: 'docs' });
 ```
 
-The session is self-healing: a toolbox is meant to be created once and kept for
-the life of a long-running host. If the server drops or expires the session (an
-idle streamable-HTTP session answering `404`, a transport that went away), the
-next call reconnects and is retried once on the fresh session — no `close()` and
-rebuild needed. Retries only cover transport-level failures between requests, so
-a tool that actually ran never runs twice: errors the server reports for a tool
-(`isError`) and well-formed protocol errors are raised as-is.
+Search uses BM25 over the currently allowed tool names and descriptions. Results include the server ID, tool name, description, input schema, revision, score, stale marker, and cursor. Calls re-check the currently published catalog and input schema. A call that has already been sent is never automatically replayed.
 
-Policy stays with you via two optional hooks:
+## Automatic catalog refresh
 
-- `on_result(tool_name, value)` — post-process each result (e.g. turn a
-  `{"rows": [...]}` payload into a DataFrame).
-- `on_error(tool_name, result)` — return the exception to raise when a tool
-  reports an error (defaults to `dolsot.mcp.McpToolError`).
+Automatic refresh is enabled by default in a long-running host. The host refreshes on initial connection and reconnection, coalesces tool-list change notifications over a proposed 250 ms debounce, and refreshes periodically even when a server sends no notifications. The proposed default period is five minutes; override it with `DOLSOT_MCP_REFRESH_INTERVAL_MS` (1,000–86,400,000 ms). Each refresh caller has a proposed 30-second total deadline, including time queued behind another batch; `DOLSOT_MCP_REFRESH_TIMEOUT_MS` can set it to 1,000–300,000 ms. A server collection is also capped at that duration, and each individual page request at five seconds. A caller deadline rejects with `REFRESH_TIMEOUT`; it is not a successful partial result. Shutdown aborts collection requests. A failed connection or list refresh is retried with a per-server delay starting at one second and increasing exponentially to 60 seconds, plus small jitter; success resets the delay. Manual refresh remains available. Each caller waits for one fixed batch, not later notification batches. Overlapping callers can share collection, but receive only their requested server results. New list-change notifications own a coalesced follow-up batch. Refreshes use the same complete pagination, schema validation, and atomic catalog/index publication path. A partial failure preserves that server's last good list and marks it stale; new calls to a failed server are rejected. Every completed refresh invalidates earlier cursors, including an all-server failure; changed current tool permissions also invalidate them and filter search/catalog immediately.
 
-Notes and limits: in-process backend only (not the subprocess `Repl`); transports
-are streamable-HTTP and stdio; dispatch is dynamic, so tool calls are not covered
-by the `ty` type gate. A tool whose name collides with a toolbox method
-(`tools`, `catalog`, `help`, `close`, `call`, `http`, `stdio`) is shadowed on
-attribute access, but always reachable via `nn.call("name", ...)`.
+The MCP catalog and refresh timers live in the host process, not in the saved REPL snapshot. A one-shot CLI invocation performs initial discovery and can refresh only while that process is alive; its `finally` cleanup stops timers and closes transports before exit. A later process reconnects and discovers the catalog again. Long-running MCP hosts keep auto-refresh alive until shutdown, then clear timers/listeners, abort pending collection/call requests when the SDK supports it, and close external transports. In-flight catalog pages that have not been published are discarded during shutdown. The host refresh API accepts `registry.refresh(serverId, { signal, deadline })`, where deadline is an absolute epoch timestamp in milliseconds. The guest `mcp.refresh()` handler receives the cell signal and deadline automatically. A cancelled or expired waiter releases its handler slot without cancelling other subscribers; collection is aborted and not published when its last subscriber leaves. An independently owned automatic follow-up can still run. Cancellation before publication keeps the last catalog and does not mark a healthy server as failed. Initial discovery that exceeds its refresh deadline closes its connected transports before reporting the startup error. These deadlines bound asynchronous queue/collection waits; they cannot preempt synchronous host modules or schema validation while the Node event loop is blocked. Toolbox handlers that ignore their supplied abort signal may continue running; cancellation does not guarantee rollback of remote effects.
 
-## Sessions and `SessionStore`
+## Serving Dolsot over MCP
 
-A session is opaque bytes to dolsot — the worker process owns pickling (via
-`dill`) and unpickling; the host only ever loads and saves a blob under a
-session id. Only what `dill` can serialize survives: when the namespace holds an
-unpicklable live object, the worker saves everything else and drops just that
-name (surfaced on `Result.dropped`), rather than losing the whole session. That's
-the whole `SessionStore` protocol:
+Build the private local tarball before using its installed `dolsot` bin:
 
-```python
-from typing import Protocol
-
-class SessionStore(Protocol):
-    def load(self, sid: str) -> bytes | None: ...
-    def save(self, sid: str, blob: bytes) -> None: ...
-    def delete(self, sid: str) -> int: ...   # sid == "all" wipes everything
-    def list(self) -> list[SessionInfo]: ...
+```sh
+npm pack --pack-destination .
 ```
 
-Two implementations ship in `dolsot.store`:
+Loopback Streamable HTTP:
 
-- **`FileStore`** (the default) — one pickle file per session under a
-  directory (`DOLSOT_CACHE_DIR`, or an OS-agnostic default under the platform
-  temp dir, `{tempdir}/dolsot-{uid}/sessions`). The temp dir can be shared and
-  world-writable (e.g. `/tmp` on Linux), and a session pickle **runs code when
-  dill loads it**, so the default is namespaced per uid and created `0700`;
-  FileStore refuses a session dir that is a symlink or not owned by the current
-  user. Because temp dirs are cleared on reboot and by system reapers, default
-  persistence is **best-effort**; point `DOLSOT_CACHE_DIR` at a durable directory
-  when a session must outlive that. It also reaps files untouched for
-  `DOLSOT_SESSION_TTL_DAYS` on each access (`0` disables it), where "untouched"
-  means not written — every run rewrites its session, so an actively-used session
-  is never reaped.
-- **`MemoryStore`** — an in-process dict, no TTL. No persistence beyond the
-  host process's lifetime; mainly for tests and short-lived hosts.
-
-Writing a custom store (e.g. Redis, S3, a database row) means implementing
-those four methods and passing an instance to `Repl`:
-
-```python
-from dolsot import Repl
-
-class RedisStore:
-    def __init__(self, client):
-        self.client = client
-
-    def load(self, sid: str) -> bytes | None:
-        return self.client.get(f"dolsot:{sid}")
-
-    def save(self, sid: str, blob: bytes) -> None:
-        self.client.set(f"dolsot:{sid}", blob)
-
-    def delete(self, sid: str) -> int:
-        if sid == "all":
-            keys = self.client.keys("dolsot:*")
-            return self.client.delete(*keys) if keys else 0
-        return self.client.delete(f"dolsot:{sid}")
-
-    def list(self):
-        ...  # SessionInfo(id, size_bytes, last_used) per key
-
-repl = Repl(inject={"mt": "mytools"}, store=RedisStore(my_redis_client))
+```sh
+npx --yes --package ./dolsot-1.0.0-alpha.0.tgz -- dolsot mcp --transport http --host 127.0.0.1 --port 3000
 ```
 
-A store deals in bytes only — it must never deserialize a session, and
-dolsot never asks it to.
+Register `http://127.0.0.1:3000/mcp` in an MCP client. The server provides `dolsot_run`, `dolsot_sessions`, and `dolsot_reset`; with `DOLSOT_MCP_CONFIG`, it also provides `mcp_search`, `mcp_refresh`, and `mcp_call`. Reuse the same `session` argument to continue cell state. MCP transport connections do not identify REPL sessions. HTTP currently binds only to `127.0.0.1`; remote exposure and multi-user authentication are not implemented. Sessions belong to the host's configured store and are not isolated by authenticated user identity.
 
-## Configuration
+stdio server for MCP hosts that spawn a process:
 
-Every setting can be passed explicitly to `Repl(...)`, or left to fall back
-to an environment variable, or a hardcoded default. Precedence is always:
+```sh
+npx --yes --package ./dolsot-1.0.0-alpha.0.tgz -- dolsot mcp --transport stdio
+```
 
-**explicit argument > environment variable > default.**
+The MCP server process keeps memory sessions and automatic refresh state until it exits. Set `DOLSOT_SESSION_DIR` if sessions should survive its restart.
 
-| variable | controls | default |
-|---|---|---|
-| `DOLSOT_CACHE_DIR` | `FileStore`'s session directory | `{tempdir}/dolsot-{uid}/sessions` |
-| `DOLSOT_SESSION_TTL_DAYS` | days a session file survives unused before `FileStore` reaps it (`0` disables reaping) | `7` |
-| `DOLSOT_TIMEOUT` | wall-clock seconds before a cell is killed. Bounds the **whole worker lifetime** — interpreter startup, session load/dump, the type gate, and your code — not your code alone, so loading a very large session eats into it. The gate caps its own run at this budget too | `20` |
-| `DOLSOT_MAX_OUTPUT` | max chars of `stdout`/`value` kept before truncation (`0` disables the cap) | `100000` |
-| `DOLSOT_TYPECHECK` | set to `0` to skip the `ty` type gate before running a cell | `1` (on) |
-| `DOLSOT_TY_BIN` | the `ty` binary to invoke for the type gate | `ty` |
+## Python 0.x differences
 
-The `dolsot` CLI's `--timeout` maps straight to `Repl(timeout=...)`; when the
-flag is omitted the CLI passes `None`, so `DOLSOT_TIMEOUT` (or the built-in
-default) applies exactly as it would from the library. There is no
-`--cache-dir` flag — set `DOLSOT_CACHE_DIR` instead.
+The session-and-toolbox workflow remains, but cells use JavaScript and asynchronous tool calls use `await`. Python syntax, Python modules/DataFrames, and Python pickle/dill session files are not compatible or converted. Existing Python users can keep using the `v0.4.2` tag/PyPI release or the `v0` branch. The QuickJS guest is separate from the Node host; host toolbox handlers run with host permissions.
+
+## Local verification limits
+
+The pinned local dependency set is Node.js 24, `quickjs-wasi` 3.6.3, MCP TypeScript SDK 1.32.2, Ajv 8.20.0, `proper-lockfile` 4.1.2, and Zod 4.6.7. The package remains private and unpublished. The commands above assume the package tarball has been generated with `npm pack --pack-destination .`; this does not establish public npm availability. The per-host execution/session limits do not impose an OS RSS cap or a machine-wide quota. Remote HTTP authentication, multi-user principal isolation, other OSes and client implementations, the 2026 MCP protocol revision, and performance under production load remain unverified.

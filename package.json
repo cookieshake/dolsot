@@ -1,0 +1,30 @@
+{
+  "name": "dolsot",
+  "version": "1.0.0-alpha.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": "./src/index.mjs",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test --test-concurrency=1",
+    "test:gate": "node --test test/quickjs-gate.test.mjs"
+  },
+  "bin": {
+    "dolsot": "src/cli.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "ajv": "8.20.0",
+    "proper-lockfile": "4.1.2",
+    "quickjs-wasi": "3.6.3",
+    "zod": "4.6.7"
+  }
+}
