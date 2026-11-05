@@ -74,7 +74,7 @@ test('registry tools run inside persistent QuickJS sessions through the host bri
 });
 
 test('external MCP HTTP connection can list and call tools through Streamable HTTP', async () => {
-  const upstream = await serveHttp(new DolsotRuntime(), null, { port: 0 });
+  const upstream = await serveHttp(new DolsotRuntime(), { port: 0 });
   const registry = await McpRegistry.open({
     servers: [{ id: 'upstream', transport: 'http', url: upstream.url }],
   });
@@ -90,6 +90,39 @@ test('external MCP HTTP connection can list and call tools through Streamable HT
   } finally {
     await registry.close();
     await upstream.close();
+  }
+});
+
+test('configured MCP backends stay available in cells without adding external MCP tools', async () => {
+  const registry = await makeRegistry();
+  const withoutRegistry = await serveHttp(new DolsotRuntime(), { port: 0 });
+  const runtime = new DolsotRuntime({ toolboxes: registry.toolboxes() });
+  const withRegistry = await serveHttp(runtime, { port: 0 });
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const clients = [withoutRegistry, withRegistry].map(service => new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} }));
+  const transports = [withoutRegistry, withRegistry].map(service => new StreamableHTTPClientTransport(new URL(service.url)));
+  try {
+    await Promise.all(clients.map((client, index) => client.connect(transports[index])));
+    const before = await clients[0].listTools();
+    const after = await clients[1].listTools();
+    const expectedNames = ['dolsot_reset', 'dolsot_run', 'dolsot_sessions'];
+    assert.deepEqual(before.tools.map(item => item.name).sort(), expectedNames);
+    assert.deepEqual(after.tools.map(item => item.name).sort(), expectedNames);
+
+    const result = await clients[1].callTool({
+      name: 'dolsot_run',
+      arguments: {
+        session: 'configured-mcp',
+        code: "var hits = await mcp.search({query:'add numbers',serverId:'docs'}); var catalog = await mcp.catalog({serverId:'docs'}); var sum = await mcp.call({serverId:'docs',toolName:hits.tools[0].toolName,arguments:{a:20,b:22}}); ({hit:hits.tools[0].toolName,catalog:catalog.map(item=>item.toolName),sum:sum.sum})",
+      },
+    });
+    const cellValue = JSON.parse(result.structuredContent.value);
+    assert.equal(cellValue.hit, 'add');
+    assert(cellValue.catalog.includes('add'));
+    assert.equal(cellValue.sum, 42);
+  } finally {
+    await Promise.all(clients.map(client => client.close()));
+    await Promise.all([withoutRegistry.close(), withRegistry.close(), registry.close()]);
   }
 });
 
@@ -109,7 +142,7 @@ test('periodic refresh discovers changes when the upstream sends no list-changed
 
 test('HTTP MCP exposes run/session/reset tools over loopback Streamable HTTP', async () => {
   const runtime = new DolsotRuntime();
-  const service = await serveHttp(runtime, null, { port: 0 });
+  const service = await serveHttp(runtime, { port: 0 });
   const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
   const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
   const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
@@ -117,11 +150,17 @@ test('HTTP MCP exposes run/session/reset tools over loopback Streamable HTTP', a
   try {
     await client.connect(transport);
     const tools = await client.listTools();
-    assert(tools.tools.some(tool => tool.name === 'dolsot_run'));
+    assert.deepEqual(tools.tools.map(tool => tool.name).sort(), ['dolsot_reset', 'dolsot_run', 'dolsot_sessions']);
     const first = await client.callTool({ name: 'dolsot_run', arguments: { session: 'http', code: 'var n = 40; n + 2' } });
     assert.equal(first.structuredContent.value, '42');
     const second = await client.callTool({ name: 'dolsot_run', arguments: { session: 'http', code: 'n + 1' } });
     assert.equal(second.structuredContent.value, '41');
+    const sessions = await client.callTool({ name: 'dolsot_sessions', arguments: {} });
+    assert(sessions.structuredContent.sessions.some(session => session.id === 'http'));
+    const reset = await client.callTool({ name: 'dolsot_reset', arguments: { session: 'http' } });
+    assert.equal(reset.structuredContent.reset, 1);
+    const afterReset = await client.callTool({ name: 'dolsot_sessions', arguments: {} });
+    assert.equal(afterReset.structuredContent.sessions.some(session => session.id === 'http'), false);
     const denied = await fetch(service.url, { method: 'POST', headers: { Origin: 'http://evil.example', 'Content-Type': 'application/json' }, body: '{}' });
     assert.equal(denied.status, 403);
     const get = await fetch(service.url, { method: 'GET', headers: { Accept: 'text/event-stream' } });

@@ -137,7 +137,7 @@ Loopback Streamable HTTP:
 npx --yes --package ./dolsot-1.0.0-alpha.0.tgz -- dolsot mcp --transport http --host 127.0.0.1 --port 3000
 ```
 
-Register `http://127.0.0.1:3000/mcp` in an MCP client. The server provides `dolsot_run`, `dolsot_sessions`, and `dolsot_reset`; with `DOLSOT_MCP_CONFIG`, it also provides `mcp_search`, `mcp_refresh`, and `mcp_call`. Reuse the same `session` argument to continue cell state. MCP transport connections do not identify REPL sessions. HTTP currently binds only to `127.0.0.1`; remote exposure and multi-user authentication are not implemented. Sessions belong to the host's configured store and are not isolated by authenticated user identity.
+Register `http://127.0.0.1:3000/mcp` in an MCP client. The server provides `dolsot_run`, `dolsot_sessions`, and `dolsot_reset`. Setting `DOLSOT_MCP_CONFIG` connects backends for code cells but does not add tools to the external MCP server. Within a cell, use `mcp.search()`, `mcp.catalog()`, and `mcp.call()` to discover and call backend tools. Reuse the same `session` argument to continue cell state. MCP transport connections do not identify REPL sessions. HTTP currently binds only to `127.0.0.1`; remote exposure and multi-user authentication are not implemented. Sessions belong to the host's configured store and are not isolated by authenticated user identity.
 
 stdio server for MCP hosts that spawn a process:
 

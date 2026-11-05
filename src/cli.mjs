@@ -104,9 +104,9 @@ async function serveMcp(args) {
   if (registry) runtime.addToolbox('mcp', registry.toolboxes().mcp);
   let serverHandle;
   try {
-    if (transport === 'stdio') serverHandle = await serveStdio(runtime, registry);
+    if (transport === 'stdio') serverHandle = await serveStdio(runtime);
     else {
-      const httpServer = await serveHttp(runtime, registry, { host, port });
+      const httpServer = await serveHttp(runtime, { host, port });
       serverHandle = httpServer;
       process.stdout.write(`${httpServer.url}\n`);
     }

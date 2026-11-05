@@ -4,7 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod/v4';
 
-function createServer(runtime, registry) {
+function createServer(runtime) {
   const server = new McpServer({ name: 'dolsot', version: '1.0.0-alpha.0' }, { capabilities: {} });
   server.registerTool('dolsot_run', {
     description: 'Run one JavaScript cell in a named persistent session.',
@@ -31,39 +31,11 @@ function createServer(runtime, registry) {
     const result = { reset: await runtime.reset(session) };
     return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
   });
-  if (registry) {
-    server.registerTool('mcp_search', {
-      description: 'Search currently allowed external MCP tools by name and description.',
-      inputSchema: { query: z.string(), serverId: z.string().optional(), limit: z.number().int().positive().max(50).optional(), cursor: z.string().optional() },
-    }, async args => {
-      const result = await registry.search(args);
-      return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
-    });
-    server.registerTool('mcp_refresh', {
-      description: 'Refresh external MCP tool catalogs.',
-      inputSchema: { serverId: z.string().optional() },
-    }, async ({ serverId }) => {
-      const result = await registry.refresh(serverId);
-      return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result, isError: !result.ok };
-    });
-    server.registerTool('mcp_call', {
-      description: 'Call a currently allowed external MCP tool.',
-      inputSchema: {
-        serverId: z.string(),
-        toolName: z.string(),
-        arguments: z.record(z.string(), z.unknown()).optional(),
-        expectedToolRevision: z.string().optional(),
-      },
-    }, async args => {
-      const result = await registry.call(args);
-      return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
-    });
-  }
   return server;
 }
 
-export async function serveStdio(runtime, registry) {
-  const server = createServer(runtime, registry);
+export async function serveStdio(runtime) {
+  const server = createServer(runtime);
   const transport = new StdioServerTransport();
   let resolveClosed;
   const closed = new Promise(resolve => { resolveClosed = resolve; });
@@ -75,7 +47,7 @@ export async function serveStdio(runtime, registry) {
   };
 }
 
-export async function serveHttp(runtime, registry, { host = '127.0.0.1', port = 3000 } = {}) {
+export async function serveHttp(runtime, { host = '127.0.0.1', port = 3000 } = {}) {
   if (host !== '127.0.0.1') throw new TypeError('HTTP MCP currently binds only to 127.0.0.1');
   if (!Number.isInteger(port) || port < 0 || port > 65_535) throw new RangeError('port must be 0–65535');
   const httpServer = http.createServer(async (req, res) => {
@@ -104,7 +76,7 @@ export async function serveHttp(runtime, registry, { host = '127.0.0.1', port = 
         return;
       }
     }
-    const server = createServer(runtime, registry);
+    const server = createServer(runtime);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     try {
       await server.connect(transport);
