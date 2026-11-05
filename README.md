@@ -103,6 +103,34 @@ Build the private local tarball before using its installed `dolsot` bin:
 npm pack --pack-destination .
 ```
 
+### Run from GitHub with npx
+
+The package is not published to npm, so `npx dolsot@1` is not available. You can run the GitHub source with Node.js 24 or newer. From your project root, keep disk-backed sessions in a project-specific directory and add `.dolsot/` to that project's `.gitignore`:
+
+```sh
+mkdir -p .dolsot/sessions
+grep -qxF '.dolsot/' .gitignore || echo '.dolsot/' >> .gitignore
+export DOLSOT_SESSION_DIR="$PWD/.dolsot/sessions"
+export DOLSOT_PACKAGE='github:cookieshake/dolsot#main'
+
+npx --yes --package="$DOLSOT_PACKAGE" -- dolsot --session work 'var total = 40; total += 2; total'
+npx --yes --package="$DOLSOT_PACKAGE" -- dolsot --session work 'total += 1; total'
+```
+
+The two separate CLI processes share the `work` snapshot through `DOLSOT_SESSION_DIR`. Without that variable, session state lasts only for the host process. `#main` selects a moving branch; for a reproducible source revision, replace it with a commit SHA, or use a tag when you want a named release ref. A branch update does not guarantee that every npx invocation immediately runs the latest commit because package-manager caching may apply.
+
+To start an MCP server from the same GitHub source, use one of these commands:
+
+```sh
+# stdio: the MCP client starts and manages this process
+npx --yes --package="$DOLSOT_PACKAGE" -- dolsot mcp --transport stdio
+
+# Streamable HTTP: keep this server running for a client on the same host
+npx --yes --package="$DOLSOT_PACKAGE" -- dolsot mcp --transport http --host 127.0.0.1 --port 3000
+```
+
+For HTTP, register `http://127.0.0.1:3000/mcp` in the client. The server binds only to loopback and does not provide remote authentication or multi-user isolation.
+
 Loopback Streamable HTTP:
 
 ```sh
