@@ -36,7 +36,7 @@ async function makeRegistry(overrides = {}) {
 test('stdio external MCP tools are discovered, BM25-ranked, called, and refreshed on list change', async () => {
   const registry = await makeRegistry();
   try {
-    const initial = await registry.catalogList({ serverId: 'docs' });
+    const initial = (await registry.list({ serverId: 'docs' })).tools;
     assert(initial.some(tool => tool.toolName === 'add'));
     const search = await registry.search({ query: 'meeting document', serverId: 'docs' });
     assert.equal(search.tools.length > 0, true);
@@ -45,7 +45,7 @@ test('stdio external MCP tools are discovered, BM25-ranked, called, and refreshe
     const add = await registry.call({ serverId: 'docs', toolName: 'add', arguments: { a: 2, b: 3 } });
     assert.deepEqual(add, { sum: 5 });
     await registry.call({ serverId: 'docs', toolName: 'change_catalog', arguments: {} });
-    await waitUntil(async () => (await registry.catalogList({ serverId: 'docs' })).some(tool => tool.toolName === 'get_notes'));
+    await waitUntil(async () => ((await registry.list({ serverId: 'docs' })).tools).some(tool => tool.toolName === 'get_notes'));
     const cursorPage = await registry.search({ query: 'meeting', serverId: 'docs', limit: 1 });
     const oldRevision = cursorPage.catalogRevision;
     await registry.refresh('docs');
@@ -79,7 +79,7 @@ test('external MCP HTTP connection can list and call tools through Streamable HT
     servers: [{ id: 'upstream', transport: 'http', url: upstream.url }],
   });
   try {
-    const tools = await registry.catalogList({ serverId: 'upstream' });
+    const tools = (await registry.list({ serverId: 'upstream' })).tools;
     assert(tools.some(tool => tool.toolName === 'dolsot_run'));
     const result = await registry.call({
       serverId: 'upstream',
@@ -113,7 +113,7 @@ test('configured MCP backends stay available in cells without adding external MC
       name: 'dolsot_run',
       arguments: {
         session: 'configured-mcp',
-        code: "var hits = await mcp.search({query:'add numbers',serverId:'docs'}); var catalog = await mcp.catalog({serverId:'docs'}); var sum = await mcp.call({serverId:'docs',toolName:hits.tools[0].toolName,arguments:{a:20,b:22}}); ({hit:hits.tools[0].toolName,catalog:catalog.map(item=>item.toolName),sum:sum.sum})",
+        code: "var hits = await mcp.search({query:'add numbers',serverId:'docs'}); var catalog = await mcp.list({serverId:'docs'}); var sum = await mcp.call({serverId:'docs',toolName:hits.tools[0].toolName,arguments:{a:20,b:22}}); ({hit:hits.tools[0].toolName,catalog:catalog.tools.map(item=>item.toolName),sum:sum.sum})",
       },
     });
     const cellValue = JSON.parse(result.structuredContent.value);
@@ -132,7 +132,7 @@ test('periodic refresh discovers changes when the upstream sends no list-changed
   const registry = await makeRegistry();
   try {
     await registry.call({ serverId: 'docs', toolName: 'change_without_notification', arguments: {} });
-    await waitUntil(async () => (await registry.catalogList({ serverId: 'docs' })).some(tool => tool.toolName === 'get_notes'), 4_000);
+    await waitUntil(async () => ((await registry.list({ serverId: 'docs' })).tools).some(tool => tool.toolName === 'get_notes'), 4_000);
   } finally {
     await registry.close();
     if (oldInterval === undefined) delete process.env.DOLSOT_MCP_REFRESH_INTERVAL_MS;
@@ -192,7 +192,7 @@ test('failed initial MCP discovery is reported as unavailable and partial', asyn
     const result = await registry.search({ query: 'anything' });
     assert.equal(result.partial, true);
     assert.equal(result.serverStatuses[0].state, 'failed');
-    await assert.rejects(registry.call({ serverId: 'missing', toolName: 'nope' }), /tool is unavailable|CATALOG_UNAVAILABLE/);
+    await assert.rejects(registry.call({ serverId: 'missing', toolName: 'nope' }), /MCP_TOOL_UNAVAILABLE|CATALOG_UNAVAILABLE/);
   } finally {
     await registry.close();
   }
@@ -207,7 +207,7 @@ test('failed initial connection is retried and republishes tools after reconnect
   });
   try {
     assert.equal((await registry.search({ query: 'recovered' })).partial, true);
-    await waitUntil(async () => (await registry.catalogList({ serverId: 'retry' })).some(tool => tool.toolName === 'recovered'), 20_000);
+    await waitUntil(async () => ((await registry.list({ serverId: 'retry' })).tools).some(tool => tool.toolName === 'recovered'), 20_000);
     assert.equal((await registry.search({ query: 'recovered' })).partial, false);
   } finally {
     await registry.close();
@@ -231,9 +231,9 @@ test('host MCP config loads stdio connections and filters tools through its allo
   process.env.DOLSOT_MCP_CONFIG = configPath;
   const registry = await openMcpRegistry();
   try {
-    const tools = await registry.catalogList({ serverId: 'docs' });
+    const tools = (await registry.list({ serverId: 'docs' })).tools;
     assert.deepEqual(tools.map(tool => tool.toolName), ['search_documents']);
-    await assert.rejects(registry.call({ serverId: 'docs', toolName: 'add', arguments: { a: 1, b: 2 } }), /tool is unavailable/);
+    await assert.rejects(registry.call({ serverId: 'docs', toolName: 'add', arguments: { a: 1, b: 2 } }), /MCP_TOOL_DENIED/);
   } finally {
     await registry.close();
     if (previous === undefined) delete process.env.DOLSOT_MCP_CONFIG;
@@ -251,7 +251,7 @@ test('a failed reconnect drops the closed client and retries a fresh connection'
   });
   try {
     await registry.call({ serverId: 'reconnect', toolName: 'stop', arguments: {} });
-    await waitUntil(async () => (await registry.catalogList({ serverId: 'reconnect' })).some(item => item.toolName === 'recovered'), 20_000);
+    await waitUntil(async () => ((await registry.list({ serverId: 'reconnect' })).tools).some(item => item.toolName === 'recovered'), 20_000);
     const attempts = Number(await (await import('node:fs/promises')).readFile(marker, 'utf8'));
     assert(attempts >= 3);
     assert.equal(registry.servers.get('reconnect').state, 'ready');
@@ -268,10 +268,10 @@ test('permission revocation removes search/catalog entries and invalidates curso
     const first = await registry.search({ query: 'needle', limit: 1 });
     assert(first.nextCursor);
     registry.servers.get('docs').allowedTools = new Set(['a']);
-    assert.deepEqual((await registry.catalogList({ serverId: 'docs' })).map(item => item.toolName), ['a']);
+    assert.deepEqual(((await registry.list({ serverId: 'docs' })).tools).map(item => item.toolName), ['a']);
     assert.deepEqual((await registry.search({ query: 'needle' })).tools.map(item => item.toolName), ['a']);
     await assert.rejects(registry.search({ query: 'needle', limit: 1, cursor: first.nextCursor }), /CURSOR_STALE/);
-    await assert.rejects(registry.call({ serverId: 'docs', toolName: 'b' }), /tool is unavailable/);
+    await assert.rejects(registry.call({ serverId: 'docs', toolName: 'b' }), /MCP_TOOL_DENIED/);
   } finally {
     await registry.close();
   }
@@ -289,12 +289,12 @@ test('BM25 retains term frequency in document text', async () => {
   }
 });
 
-test('mcp.catalog invokes the external catalog tool instead of static toolbox metadata', async () => {
+test('mcp.list invokes the external catalog tool instead of static toolbox metadata', async () => {
   const registry = registryWithLists({ docs: async () => ({ tools: [tool('search_documents', 'Find docs')] }) });
   const runtime = new DolsotRuntime({ toolboxes: registry.toolboxes() });
   try {
     await registry.refresh();
-    const result = await runtime.run('catalog', "await mcp.catalog({serverId:'docs'})");
+    const result = await runtime.run('catalog', "await mcp.list({serverId:'docs'})");
     assert.equal(result.ok, true, JSON.stringify(result));
     assert.match(result.value, /search_documents/);
     assert.doesNotMatch(result.value, /currently allowed external MCP tools/);

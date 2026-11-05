@@ -138,15 +138,36 @@ function installToolboxes(vm, tools, restored, pending, nextCall) {
     );
     const callTool = aliasTools.find(item => item.name === 'call');
     const callTarget = callTool ? callbackName(callTool.bridgeKey) : callbackName(genericKey);
-    functions.push(`call: (name, args = {}) => typeof name === 'string' ? ${callbackName(genericKey)}(name, args) : ${callTarget}(name ?? {})`);
-    if (!aliasTools.some(item => item.name === 'catalog')) {
+    if (alias === 'mcp' && callTool) {
+      functions.push(`call: (request) => {
+        if (!request || typeof request !== 'object' || Array.isArray(request)) {
+          throw new TypeError('MCP_INVALID_CALL: use mcp.call({ serverId, toolName, arguments: {} }); see mcp.help()');
+        }
+        return ${callTarget}(request);
+      }`);
+    } else {
+      functions.push(`call: (name, args = {}) => typeof name === 'string' ? ${callbackName(genericKey)}(name, args) : ${callTarget}(name ?? {})`);
+    }
+    if (alias !== 'mcp' && !aliasTools.some(item => item.name === 'catalog')) {
       functions.push(`catalog: () => ${JSON.stringify(aliasTools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })))}`);
     }
-    functions.push(`help: () => ${JSON.stringify(aliasTools.map(({ name, description }) => ({ name, description })))}`);
+    functions.push(`help: () => ${JSON.stringify(aliasTools.map(({ name, description, inputSchema, examples }) => ({ name, description, inputSchema, examples })))}`);
     const code = `globalThis[${JSON.stringify(alias)}] = Object.freeze({ ${functions.join(', ')} });`;
     const installed = vm.evalCode(code);
     installed.dispose();
   }
+  const help = {
+    description: 'Run JavaScript cells in a persistent named session. Reuse the outer session name to continue state.',
+    usage: [
+      'Await asynchronous toolbox calls before the cell ends.',
+      'Use print() or console.log() for text output; the trailing expression returns a value.',
+      'Use var for declarations you want to re-run in the same session.',
+      'Outer MCP tools: dolsot_sessions lists sessions; dolsot_reset resets one session or all.',
+    ],
+    toolboxes: [...aliases.keys()].map(name => ({ name, help: `${name}.help()` })),
+  };
+  const installedHelp = vm.evalCode(`globalThis.help = () => (${JSON.stringify(help)});`);
+  installedHelp.dispose();
 
   function registerBridge(bridgeKey, alias, name) {
     const hostName = callbackName(bridgeKey);

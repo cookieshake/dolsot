@@ -68,6 +68,7 @@ export class DolsotRuntime {
 
   addToolbox(alias, tools) {
     if (!TOOL_ALIAS.test(alias)) throw new TypeError(`invalid toolbox alias: ${alias}`);
+    if (alias === 'help') throw new TypeError('toolbox alias help is reserved for global help()');
     if (!tools || typeof tools !== 'object' || Array.isArray(tools)) throw new TypeError('toolbox must be an object');
     const entries = new Map();
     for (const [name, spec] of Object.entries(tools)) {
@@ -79,6 +80,7 @@ export class DolsotRuntime {
         name,
         description: String(spec.description ?? ''),
         inputSchema,
+        examples: Array.isArray(spec.examples) ? spec.examples.map(String) : [],
         validate,
         handler: spec.handler,
       });
@@ -423,6 +425,7 @@ export class DolsotRuntime {
             name: spec.name,
             description: spec.description,
             inputSchema: spec.inputSchema,
+            examples: spec.examples,
             bridgeKey,
           });
         }
@@ -448,7 +451,7 @@ export class DolsotRuntime {
             return;
           }
           if (!spec || spec.alias !== message.alias || spec.name !== message.toolName) {
-            respond({ error: 'tool is unavailable' });
+            respond({ error: 'TOOLBOX_TOOL_UNAVAILABLE: local toolbox method is unavailable; see <toolbox>.help()' });
             return;
           }
           if (activeTools >= MAX_TOOL_CONCURRENCY || this.activeToolCalls >= MAX_TOOL_CONCURRENCY * MAX_ACTIVE_WORKERS) {
@@ -459,7 +462,7 @@ export class DolsotRuntime {
           try {
             encodedArgs = JSON.stringify(message.arguments ?? {});
             if (Buffer.byteLength(encodedArgs) > MAX_TOOL_BYTES) throw new Error('tool arguments exceed 1 MiB');
-            if (!spec.validate(message.arguments ?? {})) throw new Error('tool arguments do not match the input schema');
+            if (!spec.validate(message.arguments ?? {})) throw new Error(`${spec.alias === 'mcp' ? 'MCP_INVALID_ARGUMENTS' : 'TOOLBOX_INVALID_ARGUMENTS'}: tool arguments do not match the input schema; see ${spec.alias}.help()`);
           } catch (error) {
             respond({ error: error.message });
             return;

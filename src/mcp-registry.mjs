@@ -126,7 +126,7 @@ export class McpRegistry {
           stderr: 'ignore',
         });
       }
-      const client = new Client({ name: 'dolsot', version: '1.0.0-alpha.0' }, {
+      const client = new Client({ name: 'dolsot', version: '1.0.0-alpha.1' }, {
         capabilities: {},
         listChanged: {
           tools: {
@@ -483,30 +483,56 @@ export class McpRegistry {
     };
   }
 
-  async catalogList({ serverId } = {}) {
+  async list({ serverId, toolName, detail = 'summary', limit = 50, cursor } = {}) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) throw new RangeError('limit must be between 1 and 50');
+    if (!['summary', 'full'].includes(detail)) throw new TypeError('detail must be summary or full');
+    if (toolName !== undefined && (typeof toolName !== 'string' || !toolName)) throw new TypeError('toolName must be a non-empty string');
     if (serverId !== undefined && !this.servers.has(serverId)) throw new Error('MCP server is unavailable');
     const ids = serverId === undefined ? [...this.servers.keys()] : [serverId];
-    this.#permissionFingerprint(serverId ?? '*', ids);
-    return ids.flatMap(id => [...(this.catalog.get(id)?.values() ?? [])]
+    const permissions = this.#permissionFingerprint(serverId ?? '*', ids);
+    const queryHash = createHash('sha256').update(JSON.stringify(['list', serverId, toolName, detail, limit, permissions])).digest('hex');
+    let offset = 0;
+    if (cursor) ({ offset } = this.#readCursor(cursor, queryHash));
+    const tools = ids.flatMap(id => [...(this.catalog.get(id)?.values() ?? [])]
       .filter(tool => !this.servers.get(id).allowedTools || this.servers.get(id).allowedTools.has(tool.name))
+      .filter(tool => toolName === undefined || tool.name === toolName)
       .map(tool => ({
         serverId: id,
         toolName: tool.name,
-        description: tool.description,
-        inputSchema: tool.inputSchema,
+        description: detail === 'full' ? tool.description : tool.description.slice(0, 240),
+        ...(detail === 'full' ? { inputSchema: tool.inputSchema } : {}),
         toolRevision: tool.revision,
         stale: this.status.get(id)?.stale ?? false,
-      })));
+      }))).sort((a, b) => {
+        const left = `${a.serverId}\0${a.toolName}`;
+        const right = `${b.serverId}\0${b.toolName}`;
+        return left < right ? -1 : left > right ? 1 : 0;
+      });
+    return {
+      tools: tools.slice(offset, offset + limit),
+      nextCursor: offset + limit < tools.length ? this.#makeCursor(queryHash, offset + limit) : null,
+    };
   }
 
-  async call({ serverId, toolName, arguments: args = {}, expectedToolRevision } = {}, { signal } = {}) {
+  async call(input = {}, { signal } = {}) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      throw mcpError('MCP_INVALID_CALL', 'use mcp.call({ serverId, toolName, arguments: {} }); see mcp.help()');
+    }
+    const { serverId, toolName, arguments: args = {}, expectedToolRevision } = input;
+    if (typeof serverId !== 'string' || !serverId || typeof toolName !== 'string' || !toolName
+      || !args || typeof args !== 'object' || Array.isArray(args)
+      || (expectedToolRevision !== undefined && typeof expectedToolRevision !== 'string')) {
+      throw mcpError('MCP_INVALID_ARGUMENTS', 'serverId and toolName must be non-empty strings; arguments must be an object; see mcp.help()');
+    }
     if (this.closed) throw new Error('MCP registry is closed');
     const state = this.servers.get(serverId);
     const tool = this.catalog.get(serverId)?.get(toolName);
-    if (!state || !tool || (state.allowedTools && !state.allowedTools.has(toolName))) throw new Error('tool is unavailable');
+    if (!state) throw mcpError('MCP_SERVER_UNAVAILABLE', 'server is unavailable; discover serverId with mcp.list() or mcp.search()');
+    if (state.allowedTools && !state.allowedTools.has(toolName)) throw mcpError('MCP_TOOL_DENIED', 'tool is not currently allowed');
     if (state.state !== 'ready') throw new Error('CATALOG_UNAVAILABLE');
+    if (!tool) throw mcpError('MCP_TOOL_UNAVAILABLE', 'tool is absent from the published catalog; see mcp.list()');
     if (expectedToolRevision !== undefined && expectedToolRevision !== tool.revision) throw new Error('TOOL_CHANGED');
-    if (!tool.validate(args)) throw new TypeError('tool arguments do not match the current input schema');
+    if (!tool.validate(args)) throw mcpError('MCP_INVALID_ARGUMENTS', 'tool arguments do not match the current input schema; inspect mcp.list({serverId, toolName, detail: "full"})');
     const active = state.tools.get(toolName);
     if (!active || active.revision !== tool.revision) throw new Error('TOOL_CHANGED');
     const controller = new AbortController();
@@ -516,10 +542,21 @@ export class McpRegistry {
     this.activeCalls.add(controller);
     let request;
     try {
-      request = state.client.callTool({ name: toolName, arguments: args }, undefined, { timeout: 20_000, signal: controller.signal });
-      this.inflightCalls.add(request);
-      const response = await request;
-      if (response.isError) throw new Error('external MCP tool returned an error');
+      let response;
+      try {
+        request = state.client.callTool({ name: toolName, arguments: args }, undefined, { timeout: 20_000, signal: controller.signal });
+        this.inflightCalls.add(request);
+        response = await request;
+      } catch (error) {
+        throw mcpError('MCP_UPSTREAM_TRANSPORT_ERROR', JSON.stringify({ serverId, toolName, diagnostic: upstreamDiagnostic(error.message ?? String(error), state, args) }));
+      }
+      if (response.isError) {
+        const diagnostic = {
+          content: response.content?.filter(item => item.type === 'text').map(item => item.text),
+          structuredContent: response.structuredContent,
+        };
+        throw mcpError('MCP_UPSTREAM_ERROR', JSON.stringify({ serverId, toolName, diagnostic: upstreamDiagnostic(diagnostic, state, args) }));
+      }
       return response.structuredContent ?? response;
     } finally {
       this.activeCalls.delete(controller);
@@ -531,10 +568,15 @@ export class McpRegistry {
   toolboxes() {
     return {
       mcp: {
-        search: { description: 'Search allowed external MCP tools by name and description.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, serverId: { type: 'string' }, limit: { type: 'integer' }, cursor: { type: 'string' } }, required: ['query'], additionalProperties: false }, handler: args => this.search(args) },
-        catalog: { description: 'List the currently published allowed external MCP tools.', inputSchema: { type: 'object', properties: { serverId: { type: 'string' } }, additionalProperties: false }, handler: args => this.catalogList(args) },
-        refresh: { description: 'Refresh external MCP tool lists.', inputSchema: { type: 'object', properties: { serverId: { type: 'string' } }, additionalProperties: false }, handler: (args, context) => this.refresh(args.serverId, context) },
-        call: { description: 'Call a currently allowed external MCP tool.', inputSchema: { type: 'object', properties: { serverId: { type: 'string' }, toolName: { type: 'string' }, arguments: { type: 'object' }, expectedToolRevision: { type: 'string' } }, required: ['serverId', 'toolName'], additionalProperties: false }, handler: (args, context) => this.call(args, context) },
+        search: { description: 'Search allowed external MCP tools by name and description. Returns tools with serverId, toolName, inputSchema, and nextCursor.', inputSchema: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 256 }, serverId: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: MAX_LIMIT, default: 10 }, cursor: { type: 'string' } }, required: ['query'], additionalProperties: false }, examples: ['await mcp.search({ query: "read status", limit: 5 })'], handler: args => this.search(args) },
+        list: {
+          description: 'List allowed external MCP tools. Summary is the default; request full for input schemas. Follow nextCursor with the same filters/detail/limit to read all pages.',
+          inputSchema: { type: 'object', properties: { serverId: { type: 'string' }, toolName: { type: 'string', minLength: 1 }, detail: { enum: ['summary', 'full'], default: 'summary' }, limit: { type: 'integer', minimum: 1, maximum: MAX_LIMIT, default: 50 }, cursor: { type: 'string' } }, additionalProperties: false },
+          examples: ['await mcp.list({ limit: 50 })', 'await mcp.list({ serverId: selected.serverId, toolName: selected.toolName, detail: "full" })'],
+          handler: args => this.list(args),
+        },
+        refresh: { description: 'Refresh external MCP tool lists. Omit serverId to refresh all configured servers.', inputSchema: { type: 'object', properties: { serverId: { type: 'string' } }, additionalProperties: false }, examples: ['await mcp.refresh()'], handler: (args, context) => this.refresh(args.serverId, context) },
+        call: { description: 'Call an allowed external MCP tool using one object with serverId, toolName, and arguments. Get identifiers from list/search. Advanced: expectedToolRevision optionally rejects a changed definition; normally omit it.', inputSchema: { type: 'object', properties: { serverId: { type: 'string', minLength: 1 }, toolName: { type: 'string', minLength: 1 }, arguments: { type: 'object' }, expectedToolRevision: { type: 'string' } }, required: ['serverId', 'toolName'], additionalProperties: false }, examples: ['await mcp.call({ serverId: selected.serverId, toolName: selected.toolName, arguments: {} })'], handler: (args, context) => this.call(args, context) },
       },
     };
   }
@@ -595,6 +637,50 @@ export class McpRegistry {
     await Promise.allSettled([...this.inflightCalls]);
     if (this.refreshPromise) await this.refreshPromise.catch(() => {});
   }
+}
+
+function mcpError(code, message) {
+  return Object.assign(new Error(`${code}: ${message}`), { code });
+}
+
+// Only diagnostics pass through this path. Successful tool values keep their
+// original contract; request arguments and host configuration are never echoed.
+function upstreamDiagnostic(value, state, args) {
+  const sensitiveKey = /authorization|cookie|password|passwd|secret|token|api[-_]?key|credential/i;
+  const secrets = new Set();
+  const addSecret = value => {
+    if (typeof value !== 'string' || !value) return;
+    secrets.add(value);
+    if (/^Bearer\s+/i.test(value)) secrets.add(value.replace(/^Bearer\s+/i, ''));
+  };
+  for (const env of Object.values({ ...state.spec.headerEnv, ...state.spec.envFrom })) addSecret(process.env[env]);
+  const collectSecrets = (value, depth = 0) => {
+    if (!value || typeof value !== 'object' || depth > 20) return;
+    for (const [key, item] of Object.entries(value)) {
+      if (sensitiveKey.test(key)) addSecret(item);
+      else collectSecrets(item, depth + 1);
+    }
+  };
+  collectSecrets(args);
+  if (state.spec.url) {
+    const url = new URL(state.spec.url);
+    addSecret(decodeURIComponent(url.password));
+    for (const [key, item] of url.searchParams) if (sensitiveKey.test(key)) addSecret(item);
+  }
+  const orderedSecrets = [...secrets].sort((a, b) => b.length - a.length);
+  const redact = text => {
+    for (const secret of orderedSecrets) text = text.split(secret).join('[REDACTED]');
+    return text
+      .replace(/Bearer\s+[^\s,"'<>]+/gi, 'Bearer [REDACTED]')
+      .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[REDACTED]@')
+      .replace(/((?:authorization|cookie|password|passwd|secret|token|api[-_]?key|credential)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&}]+)/gi, '$1[REDACTED]');
+  };
+  const text = typeof value === 'string' ? redact(value) : JSON.stringify(value, (key, item) => {
+    if (sensitiveKey.test(key)) return '[REDACTED]';
+    return typeof item === 'string' ? redact(item) : item;
+  });
+  const bytes = Buffer.from(text ?? 'upstream returned an error');
+  return bytes.length > 2048 ? `${bytes.subarray(0, 2048).toString('utf8')}… [truncated]` : bytes.toString('utf8');
 }
 
 function refreshTimeoutError() {

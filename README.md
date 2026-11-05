@@ -45,6 +45,8 @@ A toolbox is a trusted Node.js module loaded by the host. Export `tools` as a ma
 node src/cli.mjs --session work --toolbox "$PWD/examples/math-tools.mjs:mt" 'await mt.add({a: 1, b: 2})'
 ```
 
+Start with global `help()` for cell usage and the currently installed toolbox names, then `<toolbox>.help()` for method descriptions, input schemas, and examples. The alias `help` is reserved for this entry point. Global help is refreshed when restoring sessions so it reflects the host's current toolboxes.
+
 The guest also has `mt.catalog()`, `mt.help()`, and `mt.call(name, arguments)`. If a toolbox exports a tool named `catalog`, that tool owns `mt.catalog()` and the static metadata remains available through `mt.help()`. Calls are asynchronous and need `await`. A cell that finishes while one of its host tool calls is still pending fails without saving the new snapshot and aborts the host request; handlers should honor the supplied `{ signal }` context. Abort cannot undo an external side effect already performed. Host modules have the Node process's authority and should be trusted. QuickJS guest code does not receive `process`, `require`, Node built-ins, npm packages, filesystem, or network access directly.
 
 ## Connecting external MCP tools
@@ -72,22 +74,34 @@ Set `DOLSOT_MCP_CONFIG` to a JSON file. Only the host reads it. HTTP header and 
 }
 ```
 
-With the config and referenced environment variables set, the JavaScript toolbox exposes search, catalog, refresh, and call:
+With the config and referenced environment variables set, the JavaScript toolbox exposes search, list, refresh, and call:
 
 ```js
+help();
+mcp.help();
+var page = await mcp.list({ limit: 50 });
+// Follow page.nextCursor with the same options to read every page.
 var hits = await mcp.search({ query: '회의록 검색', limit: 5 });
 var first = hits.tools[0];
+if (!first) throw new Error('No matching allowed tool');
+var details = await mcp.list({ serverId: first.serverId, toolName: first.toolName, detail: 'full' });
+// Inspect details.tools[0].inputSchema before choosing arguments.
 await mcp.call({
   serverId: first.serverId,
   toolName: first.toolName,
-  arguments: { query: '지난 회의' },
-  expectedToolRevision: first.toolRevision
+  arguments: { query: '지난 회의' }
 });
 await mcp.refresh();
 await mcp.refresh({ serverId: 'docs' });
 ```
 
 Search uses BM25 over the currently allowed tool names and descriptions. Results include the server ID, tool name, description, input schema, revision, score, stale marker, and cursor. Calls re-check the currently published catalog and input schema. A call that has already been sent is never automatically replayed.
+
+`mcp.list({ serverId?, toolName?, detail?, limit?, cursor? })` always returns `{ tools, nextCursor }`. It defaults to `detail: 'summary'` (identifiers, description up to 240 characters, revision, stale status) and 50 tools per page; `limit` is 1–50. `detail: 'full'` includes the full description and input schema. Filters are exact and optional; without a query or filter, pagination enumerates all currently allowed tools in server/name order. Cursors are bound to the filters, detail, limit, permissions, and catalog generation; refresh or permission changes reject old cursors with `CURSOR_STALE`.
+
+Migration in `1.0.0-alpha.1`: replace `mcp.catalog()` with `mcp.list({ detail: 'full' })` and read `.tools` from the response, following `nextCursor` for more pages. `mcp.catalog` is removed from the external MCP toolbox. General JavaScript toolboxes keep their existing `.catalog()` and string `.call(name, arguments)` helpers. External `mcp.call` accepts only an object; strings fail immediately with `MCP_INVALID_CALL` and a correct example. The optional advanced `expectedToolRevision` can copy a discovered `toolRevision` to reject changed definitions with `TOOL_CHANGED`. It checks the host's published definition, so it cannot detect changes the host has not collected yet; ordinary examples omit it.
+
+Failures distinguish local toolbox lookup (`TOOLBOX_TOOL_UNAVAILABLE`), malformed MCP calls (`MCP_INVALID_CALL`/`MCP_INVALID_ARGUMENTS`), missing servers/tools (`MCP_SERVER_UNAVAILABLE`/`MCP_TOOL_UNAVAILABLE`), current allowlist rejection (`MCP_TOOL_DENIED`), and upstream tool/transport errors (`MCP_UPSTREAM_ERROR`/`MCP_UPSTREAM_TRANSPORT_ERROR`). Upstream failures retain server/tool identifiers and a diagnostic capped at 2048 bytes plus a truncation marker. Configured credentials and recognizable secret fields, bearer tokens, and URL credentials are redacted before truncation. Arbitrary upstream text can contain unlabelled private data, so this is best-effort redaction, not a general data-loss prevention boundary. Calls are never retried automatically.
 
 ## Automatic catalog refresh
 
@@ -134,15 +148,15 @@ For HTTP, register `http://127.0.0.1:3000/mcp` in the client. The server binds o
 Loopback Streamable HTTP:
 
 ```sh
-npx --yes --package ./dolsot-1.0.0-alpha.0.tgz -- dolsot mcp --transport http --host 127.0.0.1 --port 3000
+npx --yes --package ./dolsot-1.0.0-alpha.1.tgz -- dolsot mcp --transport http --host 127.0.0.1 --port 3000
 ```
 
-Register `http://127.0.0.1:3000/mcp` in an MCP client. The server provides `dolsot_run`, `dolsot_sessions`, and `dolsot_reset`. Setting `DOLSOT_MCP_CONFIG` connects backends for code cells but does not add tools to the external MCP server. Within a cell, use `mcp.search()`, `mcp.catalog()`, and `mcp.call()` to discover and call backend tools. Reuse the same `session` argument to continue cell state. MCP transport connections do not identify REPL sessions. HTTP currently binds only to `127.0.0.1`; remote exposure and multi-user authentication are not implemented. Sessions belong to the host's configured store and are not isolated by authenticated user identity.
+Register `http://127.0.0.1:3000/mcp` in an MCP client. The server provides `dolsot_run`, `dolsot_sessions`, and `dolsot_reset`. `dolsot_run` keeps its description short and points to global `help()`. Its optional `timeout` is an integer number of seconds from 1 to 1200 (the host default is 20 seconds unless configured). Setting `DOLSOT_MCP_CONFIG` connects backends for code cells but does not add tools to the external MCP server. Within a cell, use `mcp.help()`, `mcp.search()`, `mcp.list()`, and object-form `mcp.call()` to discover and call backend tools. Reuse the same `session` argument to continue cell state. MCP transport connections do not identify REPL sessions. HTTP currently binds only to `127.0.0.1`; remote exposure and multi-user authentication are not implemented. Sessions belong to the host's configured store and are not isolated by authenticated user identity.
 
 stdio server for MCP hosts that spawn a process:
 
 ```sh
-npx --yes --package ./dolsot-1.0.0-alpha.0.tgz -- dolsot mcp --transport stdio
+npx --yes --package ./dolsot-1.0.0-alpha.1.tgz -- dolsot mcp --transport stdio
 ```
 
 The MCP server process keeps memory sessions and automatic refresh state until it exits. Set `DOLSOT_SESSION_DIR` if sessions should survive its restart.
