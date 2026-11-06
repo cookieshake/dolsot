@@ -5,10 +5,17 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod/v4';
 
 function createServer(runtime) {
-  const server = new McpServer({ name: 'dolsot', version: '1.0.0-alpha.0' }, { capabilities: {} });
+  const server = new McpServer({ name: 'dolsot', version: '1.0.0-alpha.1' }, {
+    capabilities: {},
+    instructions: 'Run JavaScript with dolsot_run. Start with help() inside a cell to discover usage and available toolboxes, then <toolbox>.help() for method details. Reuse session to continue state; use dolsot_sessions to list and dolsot_reset to reset sessions.',
+  });
   server.registerTool('dolsot_run', {
-    description: 'Run one JavaScript cell in a named persistent session.',
-    inputSchema: { session: z.string(), code: z.string(), timeout: z.number().int().positive().optional() },
+    description: 'Run JavaScript in a named persistent session. Start with help() for usage and available toolboxes.',
+    inputSchema: {
+      session: z.string().describe('Session name; reuse it to continue JavaScript state.'),
+      code: z.string().describe('JavaScript cell. Await asynchronous toolbox calls; print() or console.log() outputs text, and the trailing expression returns a value.'),
+      timeout: z.number().int().min(1).max(1200).optional().describe('Seconds, 1–1200; defaults to the host timeout (20 seconds unless configured). For 10 seconds, pass 10.'),
+    },
   }, async ({ session, code, timeout }) => {
     const result = await runtime.run(session, code, timeout === undefined ? {} : { timeoutMs: timeout * 1000 });
     return {
