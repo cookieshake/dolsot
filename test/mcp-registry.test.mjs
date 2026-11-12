@@ -48,10 +48,16 @@ async function makeRegistry(overrides = {}) {
 function embeddingSearch(vectorFor, onEmbed = () => {}) {
   return new EmbeddingSearch({
     modelLoader: async () => async texts => {
-      onEmbed(texts);
+      await onEmbed(texts);
       return texts.map(vectorFor);
     },
   });
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
 }
 
 test('stdio external MCP tools are discovered, BM25-ranked, called, and refreshed on list change', async () => {
@@ -419,6 +425,121 @@ test('tool embeddings are cached and refreshed when name or description changes'
     assert.equal(embedded.filter(text => text === 'lookup\nupdated description').length, 1);
     assert.equal(embedded.filter(text => text === 'find_lookup\nupdated description').length, 1);
   } finally {
+    await registry.close();
+  }
+});
+
+test('search rejects a removed tool after delayed inference and reconciles the embedding cache', async () => {
+  let currentTools = [tool('a', 'needle'), tool('b', 'needle')];
+  const entered = deferred();
+  const release = deferred();
+  const registry = registryWithLists({ docs: async () => ({ tools: currentTools }) });
+  registry.embeddingSearch = embeddingSearch(() => [1, 0], async texts => {
+    if (texts.some(text => text.startsWith('a\n'))) {
+      entered.resolve();
+      await release.promise;
+    }
+  });
+  try {
+    await registry.refresh();
+    const pending = registry.search({ query: 'needle', mode: 'vector' });
+    await entered.promise;
+    currentTools = [tool('b', 'needle')];
+    await registry.refresh();
+    release.resolve();
+    await assert.rejects(pending, /CURSOR_STALE/);
+    assert.equal(registry.embeddingSearch.cache.has('docs\0a'), false);
+    assert.equal(registry.embeddingSearch.cache.has('docs\0b'), true);
+  } finally {
+    release.resolve();
+    await registry.close();
+  }
+});
+
+test('search rejects results and removes cached embeddings when permission is revoked during inference', async () => {
+  const entered = deferred();
+  const release = deferred();
+  const registry = registryWithLists({ docs: async () => ({ tools: [tool('a', 'needle'), tool('b', 'needle')] }) });
+  registry.servers.get('docs').allowedTools = new Set(['a', 'b']);
+  registry.embeddingSearch = embeddingSearch(() => [1, 0], async texts => {
+    if (texts.some(text => text.startsWith('a\n'))) {
+      entered.resolve();
+      await release.promise;
+    }
+  });
+  try {
+    await registry.refresh();
+    const pending = registry.search({ query: 'needle', mode: 'vector' });
+    await entered.promise;
+    registry.servers.get('docs').allowedTools = new Set(['b']);
+    release.resolve();
+    await assert.rejects(pending, /CURSOR_STALE/);
+    assert.equal(registry.embeddingSearch.cache.has('docs\0a'), false);
+    assert.equal(registry.embeddingSearch.cache.has('docs\0b'), true);
+  } finally {
+    release.resolve();
+    await registry.close();
+  }
+});
+
+test('BM25 fallback cannot return a stale catalog after inference fails during refresh', async () => {
+  let currentTools = [tool('a', 'needle'), tool('b', 'needle')];
+  const entered = deferred();
+  const release = deferred();
+  const registry = registryWithLists({ docs: async () => ({ tools: currentTools }) });
+  registry.embeddingSearch = {
+    syncCatalog() {},
+    async rank() {
+      entered.resolve();
+      await release.promise;
+      throw new Error('synthetic inference failure');
+    },
+    clear() {},
+  };
+  try {
+    await registry.refresh();
+    const pending = registry.search({ query: 'needle', mode: 'hybrid' });
+    await entered.promise;
+    currentTools = [tool('b', 'needle')];
+    await registry.refresh();
+    release.resolve();
+    await assert.rejects(pending, /CURSOR_STALE/);
+  } finally {
+    release.resolve();
+    await registry.close();
+  }
+});
+
+test('page search revalidates its existing cursor after delayed inference and refresh', async () => {
+  let currentTools = [tool('a', 'needle'), tool('b', 'needle')];
+  const entered = deferred();
+  const release = deferred();
+  const registry = registryWithLists({ docs: async () => ({ tools: currentTools }) });
+  let delayNextRank = false;
+  registry.embeddingSearch = {
+    syncCatalog() {},
+    async rank(query, docs) {
+      if (delayNextRank) {
+        entered.resolve();
+        await release.promise;
+      }
+      return docs.map(tool => ({ tool, score: 1 }));
+    },
+    clear() {},
+  };
+  try {
+    await registry.refresh();
+    const first = await registry.search({ query: 'needle', limit: 1, mode: 'vector' });
+    assert(first.nextCursor);
+    delayNextRank = true;
+    const pending = registry.search({ query: 'needle', limit: 1, cursor: first.nextCursor, mode: 'vector' });
+    await entered.promise;
+    currentTools = [tool('b', 'needle')];
+    await registry.refresh();
+    release.resolve();
+    await assert.rejects(pending, /CURSOR_STALE/);
+  } finally {
+    release.resolve();
     await registry.close();
   }
 });

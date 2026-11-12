@@ -476,12 +476,14 @@ export class McpRegistry {
     const scope = serverId ?? '*';
     const ids = serverId === undefined ? [...this.servers.keys()] : [serverId];
     const permissionFingerprint = this.#permissionFingerprint(scope, ids);
+    const catalogRevision = this.catalogRevision;
+    const cursorRevision = this.cursorRevision;
     const baseQueryHash = `${scope}\0${query}\0${limit}\0${permissionFingerprint}`;
     const queryHashes = Object.fromEntries([...new Set([mode, 'bm25'])].map(rankMode => [
       rankMode,
       createHash('sha256').update(`${baseQueryHash}\0${rankMode}`).digest('hex'),
     ]));
-    const cursorState = cursor ? this.#readCursor(cursor) : null;
+    let cursorState = cursor ? this.#readCursor(cursor) : null;
     if (cursorState && !Object.values(queryHashes).includes(cursorState.queryHash)) throw new Error('CURSOR_STALE');
     const offset = cursorState?.offset ?? 0;
     const docs = this.#toolsForServers(ids);
@@ -502,6 +504,13 @@ export class McpRegistry {
       }
     }
     const queryHash = queryHashes[rankMode];
+    const currentPermissionFingerprint = this.#permissionFingerprint(scope, ids);
+    if (this.catalogRevision !== catalogRevision || this.cursorRevision !== cursorRevision
+      || currentPermissionFingerprint !== permissionFingerprint) {
+      this.embeddingSearch.syncCatalog(this.#toolsForServers([...this.servers.keys()]));
+      throw new Error('CURSOR_STALE');
+    }
+    if (cursor) cursorState = this.#readCursor(cursor, queryHash);
     if (cursorState && cursorState.queryHash !== queryHash) throw new Error('CURSOR_STALE');
     const page = ranked.slice(offset, offset + limit);
     const statuses = ids.map(id => this.status.get(id) ?? { serverId: id, state: 'connecting', stale: false });
