@@ -82,6 +82,9 @@ mcp.help();
 var page = await mcp.list({ limit: 50 });
 // Follow page.nextCursor with the same options to read every page.
 var hits = await mcp.search({ query: '회의록 검색', limit: 5 });
+var lexicalHits = await mcp.search({ query: '회의록 검색', mode: 'bm25' });
+var semanticHits = await mcp.search({ query: '회의록 검색', mode: 'vector' });
+var hybridHits = await mcp.search({ query: '회의록 검색', mode: 'hybrid' });
 var first = hits.tools[0];
 if (!first) throw new Error('No matching allowed tool');
 var details = await mcp.list({ serverId: first.serverId, toolName: first.toolName, detail: 'full' });
@@ -95,7 +98,11 @@ await mcp.refresh();
 await mcp.refresh({ serverId: 'docs' });
 ```
 
-Search uses BM25 over the currently allowed tool names and descriptions. Results include the server ID, tool name, description, input schema, revision, score, stale marker, and cursor. Calls re-check the currently published catalog and input schema. A call that has already been sent is never automatically replayed.
+`mcp.search({ query, serverId?, limit?, cursor?, mode? })` supports `bm25`, `vector`, and `hybrid`. The optional per-call `mode` overrides the process-wide `DOLSOT_SEARCH_MODE`; when neither is set, the default is `hybrid`. BM25 uses lexical ranking only and does not load or run the embedding model. Vector uses cosine ranking only. Hybrid combines BM25 and ONNX embedding ranks with reciprocal rank fusion (RRF, `k=60`). All modes apply `limit` after ranking and preserve the same allowed-tool filtering and cursor pagination contract. Results keep the server ID, tool name, description, input schema, score (the mode score, or fused RRF score for hybrid), stale marker, and cursor. Calls re-check the currently published catalog and input schema. A call that has already been sent is never automatically replayed.
+
+Set `DOLSOT_SEARCH_MODE=bm25`, `vector`, or `hybrid` to choose the default for searches in the process. Invalid values are rejected when the MCP registry starts. A call-level `mode` overrides this default. Embeddings use the official `hotchpotch/bekko-embedding-v1-a8m` model through Transformers.js: raw query/tool text, mean pooling, and L2 normalization. Only currently allowed tool names and descriptions are embedded. Their vectors are cached in memory and refreshed when the catalog or allowlist changes; the small catalog is scored directly without a vector database. The model loads on the first vector or hybrid search and is downloaded to `.dolsot/models` by default; set `DOLSOT_EMBEDDING_CACHE_DIR` to use another cache directory. If model loading or inference fails in vector or hybrid mode, that search falls back to BM25 ranking.
+
+Run `node scripts/benchmark-search.mjs` for the bundled synthetic English/Korean top-5 comparison and latency measurements. Its query set is synthetic and is not a measurement of a real MCP catalog.
 
 `mcp.list({ serverId?, toolName?, detail?, limit?, cursor? })` always returns `{ tools, nextCursor }`. It defaults to `detail: 'summary'` (identifiers, description up to 240 characters, revision, stale status) and 50 tools per page; `limit` is 1–50. `detail: 'full'` includes the full description and input schema. Filters are exact and optional; without a query or filter, pagination enumerates all currently allowed tools in server/name order. Cursors are bound to the filters, detail, limit, permissions, and catalog generation; refresh or permission changes reject old cursors with `CURSOR_STALE`.
 

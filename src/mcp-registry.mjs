@@ -5,6 +5,7 @@ import Ajv from 'ajv';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { EmbeddingSearch, reciprocalRankFusion } from './embedding-search.mjs';
 
 const ajv = new Ajv({ allErrors: true, strict: false });
 const MAX_PAGES = 100;
@@ -12,6 +13,14 @@ const MAX_TOOLS = 1000;
 const MAX_CATALOG_BYTES = 10 * 1024 * 1024;
 const MAX_LIMIT = 50;
 const MAX_REFRESH_SERVER_MS = 30_000;
+const SEARCH_MODES = ['bm25', 'vector', 'hybrid'];
+
+function validateSearchMode(mode, source = 'mode') {
+  if (!SEARCH_MODES.includes(mode)) {
+    throw new TypeError(`${source} must be one of: ${SEARCH_MODES.join(', ')}`);
+  }
+  return mode;
+}
 
 export async function openMcpRegistry(configPath = process.env.DOLSOT_MCP_CONFIG) {
   if (configPath === undefined) return null;
@@ -45,9 +54,10 @@ export class McpRegistry {
     return registry;
   }
 
-  constructor(intervalMs, refreshTimeoutMs = MAX_REFRESH_SERVER_MS) {
+  constructor(intervalMs, refreshTimeoutMs = MAX_REFRESH_SERVER_MS, searchMode = process.env.DOLSOT_SEARCH_MODE ?? 'hybrid') {
     this.intervalMs = intervalMs;
     this.refreshTimeoutMs = refreshTimeoutMs;
+    this.searchMode = validateSearchMode(searchMode, 'DOLSOT_SEARCH_MODE');
     this.servers = new Map();
     this.catalog = new Map();
     this.catalogRevision = 0;
@@ -64,6 +74,7 @@ export class McpRegistry {
     this.permissionFingerprints = new Map();
     this.activeCalls = new Set();
     this.inflightCalls = new Set();
+    this.embeddingSearch = new EmbeddingSearch();
     this.closed = false;
   }
 
@@ -366,6 +377,7 @@ export class McpRegistry {
       this.catalog = nextCatalog;
       this.status = nextStatus;
       this.catalogRevision += 1;
+      this.embeddingSearch.syncCatalog(this.#toolsForServers([...this.servers.keys()]));
     } else {
       this.status = nextStatus;
     }
@@ -445,25 +457,61 @@ export class McpRegistry {
     }
   }
 
-  async search({ query, serverId, limit = 10, cursor } = {}) {
+  #toolsForServers(ids) {
+    const tools = [];
+    for (const id of ids) {
+      const allowed = this.servers.get(id).allowedTools;
+      for (const tool of this.catalog.get(id)?.values() ?? []) {
+        if (!allowed || allowed.has(tool.name)) tools.push(tool);
+      }
+    }
+    return tools;
+  }
+
+  async search({ query, serverId, limit = 10, cursor, mode = this.searchMode } = {}) {
     if (typeof query !== 'string' || query.length === 0 || query.length > 256) throw new TypeError('query must contain 1–256 characters');
     if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) throw new RangeError('limit must be between 1 and 50');
+    validateSearchMode(mode);
     if (serverId !== undefined && !this.servers.has(serverId)) throw new Error('MCP server is unavailable');
     const scope = serverId ?? '*';
     const ids = serverId === undefined ? [...this.servers.keys()] : [serverId];
     const permissionFingerprint = this.#permissionFingerprint(scope, ids);
-    const queryHash = createHash('sha256').update(`${scope}\0${query}\0${limit}\0${permissionFingerprint}`).digest('hex');
-    let offset = 0;
-    if (cursor) ({ offset } = this.#readCursor(cursor, queryHash));
-    const docs = [];
-    for (const id of ids) {
-      const allowed = this.servers.get(id).allowedTools;
-      for (const tool of this.catalog.get(id)?.values() ?? []) {
-        if (!allowed || allowed.has(tool.name)) docs.push(tool);
+    const catalogRevision = this.catalogRevision;
+    const cursorRevision = this.cursorRevision;
+    const baseQueryHash = `${scope}\0${query}\0${limit}\0${permissionFingerprint}`;
+    const queryHashes = Object.fromEntries([...new Set([mode, 'bm25'])].map(rankMode => [
+      rankMode,
+      createHash('sha256').update(`${baseQueryHash}\0${rankMode}`).digest('hex'),
+    ]));
+    let cursorState = cursor ? this.#readCursor(cursor) : null;
+    if (cursorState && !Object.values(queryHashes).includes(cursorState.queryHash)) throw new Error('CURSOR_STALE');
+    const offset = cursorState?.offset ?? 0;
+    const docs = this.#toolsForServers(ids);
+    const terms = [...new Set(tokenize(query))];
+    const lexical = bm25(docs, terms).filter(item => item.score > 0);
+    let ranked;
+    let rankMode = mode;
+    if (mode === 'bm25') {
+      ranked = lexical;
+    } else {
+      this.embeddingSearch.syncCatalog(this.#toolsForServers([...this.servers.keys()]));
+      try {
+        const vector = await this.embeddingSearch.rank(query, docs);
+        ranked = mode === 'vector' ? vector : reciprocalRankFusion(lexical, vector);
+      } catch {
+        ranked = lexical;
+        rankMode = 'bm25';
       }
     }
-    const terms = [...new Set(tokenize(query))];
-    const ranked = bm25(docs, terms).filter(item => item.score > 0);
+    const queryHash = queryHashes[rankMode];
+    const currentPermissionFingerprint = this.#permissionFingerprint(scope, ids);
+    if (this.catalogRevision !== catalogRevision || this.cursorRevision !== cursorRevision
+      || currentPermissionFingerprint !== permissionFingerprint) {
+      this.embeddingSearch.syncCatalog(this.#toolsForServers([...this.servers.keys()]));
+      throw new Error('CURSOR_STALE');
+    }
+    if (cursor) cursorState = this.#readCursor(cursor, queryHash);
+    if (cursorState && cursorState.queryHash !== queryHash) throw new Error('CURSOR_STALE');
     const page = ranked.slice(offset, offset + limit);
     const statuses = ids.map(id => this.status.get(id) ?? { serverId: id, state: 'connecting', stale: false });
     return {
@@ -568,7 +616,7 @@ export class McpRegistry {
   toolboxes() {
     return {
       mcp: {
-        search: { description: 'Search allowed external MCP tools by name and description. Returns tools with serverId, toolName, inputSchema, and nextCursor.', inputSchema: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 256 }, serverId: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: MAX_LIMIT, default: 10 }, cursor: { type: 'string' } }, required: ['query'], additionalProperties: false }, examples: ['await mcp.search({ query: "read status", limit: 5 })'], handler: args => this.search(args) },
+        search: { description: `Search allowed external MCP tools by name and description. mode may be bm25, vector, or hybrid; it defaults to DOLSOT_SEARCH_MODE (${this.searchMode}). Vector runtime failures fall back to BM25.`, inputSchema: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 256 }, serverId: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: MAX_LIMIT, default: 10 }, cursor: { type: 'string' }, mode: { type: 'string', enum: SEARCH_MODES } }, required: ['query'], additionalProperties: false }, examples: ['await mcp.search({ query: "read status", limit: 5 })', 'await mcp.search({ query: "read status", mode: "bm25" })', 'await mcp.search({ query: "read status", mode: "vector" })', 'await mcp.search({ query: "read status", mode: "hybrid" })'], handler: args => this.search(args) },
         list: {
           description: 'List allowed external MCP tools. Summary is the default; request full for input schemas. Follow nextCursor with the same filters/detail/limit to read all pages.',
           inputSchema: { type: 'object', properties: { serverId: { type: 'string' }, toolName: { type: 'string', minLength: 1 }, detail: { enum: ['summary', 'full'], default: 'summary' }, limit: { type: 'integer', minimum: 1, maximum: MAX_LIMIT, default: 50 }, cursor: { type: 'string' } }, additionalProperties: false },
@@ -605,13 +653,15 @@ export class McpRegistry {
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new Error('CURSOR_STALE');
     let value;
     try { value = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')); } catch { throw new Error('CURSOR_STALE'); }
-    if (value.revision !== this.cursorRevision || value.queryHash !== queryHash || !Number.isInteger(value.offset) || value.offset < 0) throw new Error('CURSOR_STALE');
+    if (value.revision !== this.cursorRevision || (queryHash !== undefined && value.queryHash !== queryHash)
+      || typeof value.queryHash !== 'string' || !Number.isInteger(value.offset) || value.offset < 0) throw new Error('CURSOR_STALE');
     return value;
   }
 
   async close() {
     if (this.closed) return;
     this.closed = true;
+    this.embeddingSearch.clear();
     if (this.timer) clearInterval(this.timer);
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.pendingRefresh.clear();
