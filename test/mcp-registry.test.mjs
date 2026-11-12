@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { DolsotRuntime } from '../src/runtime.mjs';
+import { EmbeddingSearch, reciprocalRankFusion } from '../src/embedding-search.mjs';
 import { McpRegistry, openMcpRegistry } from '../src/mcp-registry.mjs';
 import { serveHttp } from '../src/mcp-server.mjs';
 
@@ -23,13 +24,33 @@ function registryWithLists(lists) {
     registry.servers.set(id, state);
     registry.status.set(id, { serverId: id, state: 'ready', stale: false });
   }
+  registry.embeddingSearch = {
+    syncCatalog() {},
+    async rank() { throw new Error('embedding disabled in BM25 fixture'); },
+    clear() {},
+  };
   return registry;
 }
 
 async function makeRegistry(overrides = {}) {
-  return McpRegistry.open({
+  const registry = await McpRegistry.open({
     servers: [{ id: 'docs', transport: 'stdio', command: process.execPath, args: [fixture] }],
     ...overrides,
+  });
+  registry.embeddingSearch = {
+    syncCatalog() {},
+    async rank() { throw new Error('embedding disabled in BM25 fixture'); },
+    clear() {},
+  };
+  return registry;
+}
+
+function embeddingSearch(vectorFor, onEmbed = () => {}) {
+  return new EmbeddingSearch({
+    modelLoader: async () => async texts => {
+      onEmbed(texts);
+      return texts.map(vectorFor);
+    },
   });
 }
 
@@ -286,6 +307,152 @@ test('BM25 retains term frequency in document text', async () => {
     assert(result.tools[0].score > result.tools[1].score);
   } finally {
     await registry.close();
+  }
+});
+
+test('DOLSOT_SEARCH_MODE supplies the process default and call mode overrides it', async () => {
+  const previous = process.env.DOLSOT_SEARCH_MODE;
+  process.env.DOLSOT_SEARCH_MODE = 'bm25';
+  const registry = registryWithLists({ docs: async () => ({ tools: [tool('lexical', 'needle'), tool('semantic', 'different')] }) });
+  let embedCalls = 0;
+  registry.embeddingSearch = {
+    syncCatalog() {},
+    async rank() { embedCalls += 1; return [{ tool: registry.catalog.get('docs').get('semantic'), score: 1 }, { tool: registry.catalog.get('docs').get('lexical'), score: 0 }]; },
+    clear() {},
+  };
+  try {
+    assert.equal(registry.searchMode, 'bm25');
+    await registry.refresh();
+    assert.equal((await registry.search({ query: 'needle' })).tools[0].toolName, 'lexical');
+    assert.equal(embedCalls, 0);
+    assert.equal((await registry.search({ query: 'needle', mode: 'vector' })).tools[0].toolName, 'semantic');
+    assert.equal(embedCalls, 1);
+  } finally {
+    await registry.close();
+    if (previous === undefined) delete process.env.DOLSOT_SEARCH_MODE;
+    else process.env.DOLSOT_SEARCH_MODE = previous;
+  }
+});
+
+test('search rejects invalid process defaults and call modes', async () => {
+  const previous = process.env.DOLSOT_SEARCH_MODE;
+  process.env.DOLSOT_SEARCH_MODE = 'unknown';
+  try {
+    assert.throws(() => new McpRegistry(300_000), /DOLSOT_SEARCH_MODE must be one of: bm25, vector, hybrid/);
+  } finally {
+    if (previous === undefined) delete process.env.DOLSOT_SEARCH_MODE;
+    else process.env.DOLSOT_SEARCH_MODE = previous;
+  }
+  const registry = registryWithLists({ docs: async () => ({ tools: [tool('a', 'alpha')] }) });
+  try {
+    await assert.rejects(registry.search({ query: 'alpha', mode: 'unknown' }), /mode must be one of: bm25, vector, hybrid/);
+  } finally {
+    await registry.close();
+  }
+});
+
+test('vector mode ranks only by cosine and exposes all search modes in toolbox help', async () => {
+  const registry = registryWithLists({ docs: async () => ({ tools: [tool('lexical', 'needle'), tool('semantic', 'different')] }) });
+  registry.embeddingSearch = embeddingSearch(text => text === 'needle' || text.startsWith('semantic') ? [1, 0] : [0, 1]);
+  try {
+    await registry.refresh();
+    const result = await registry.search({ query: 'needle', mode: 'vector' });
+    assert.deepEqual(result.tools.map(item => item.toolName), ['semantic', 'lexical']);
+    assert.deepEqual(registry.toolboxes().mcp.search.inputSchema.properties.mode.enum, ['bm25', 'vector', 'hybrid']);
+  } finally {
+    await registry.close();
+  }
+});
+
+test('RRF combines independent rankings and uses one-based reciprocal ranks', () => {
+  const tools = ['a', 'b', 'c', 'd'].map(name => ({ serverId: 'docs', name }));
+  const fused = reciprocalRankFusion(
+    [tools[0], tools[1], tools[2], tools[3]].map(tool => ({ tool })),
+    [tools[1], tools[2], tools[0], tools[3]].map(tool => ({ tool })),
+  );
+  assert.equal(fused[0].tool.name, 'b');
+  assert(fused[0].score > fused[1].score);
+});
+
+test('hybrid search keeps allowlist filtering and applies limit after RRF', async () => {
+  const embedded = [];
+  const registry = registryWithLists({ docs: async () => ({ tools: [
+    tool('lexical-hit', 'alpha phrase'),
+    tool('semantic-hit', 'conceptually related'),
+    tool('other', 'unrelated material'),
+    tool('denied', 'alpha hidden tool'),
+  ] }) });
+  registry.servers.get('docs').allowedTools = new Set(['lexical-hit', 'semantic-hit', 'other']);
+  registry.embeddingSearch = embeddingSearch(text => {
+    if (text === 'alpha' || text.startsWith('semantic-hit\n')) return [1, 0];
+    if (text.startsWith('lexical-hit\n')) return [0, 1];
+    return [-1, 0];
+  }, texts => embedded.push(...texts));
+  try {
+    await registry.refresh();
+    const result = await registry.search({ query: 'alpha', limit: 2 });
+    assert.deepEqual(result.tools.map(item => item.toolName), ['lexical-hit', 'semantic-hit']);
+    assert.equal(result.tools.length, 2);
+    assert(!embedded.some(text => text.startsWith('denied\n')));
+  } finally {
+    await registry.close();
+  }
+});
+
+test('tool embeddings are cached and refreshed when name or description changes', async () => {
+  let name = 'lookup';
+  let description = 'old description';
+  const embedded = [];
+  const registry = registryWithLists({ docs: async () => ({ tools: [tool(name, description)] }) });
+  registry.embeddingSearch = embeddingSearch(() => [1, 0], texts => embedded.push(...texts));
+  try {
+    await registry.refresh();
+    await registry.search({ query: 'first query' });
+    await registry.search({ query: 'second query' });
+    description = 'updated description';
+    await registry.refresh();
+    await registry.search({ query: 'third query' });
+    name = 'find_lookup';
+    await registry.refresh();
+    await registry.search({ query: 'fourth query' });
+    assert.equal(embedded.filter(text => text === 'lookup\nold description').length, 1);
+    assert.equal(embedded.filter(text => text === 'lookup\nupdated description').length, 1);
+    assert.equal(embedded.filter(text => text === 'find_lookup\nupdated description').length, 1);
+  } finally {
+    await registry.close();
+  }
+});
+
+test('search pagination rejects a cursor if model failure changes the ranking mode', async () => {
+  const registry = registryWithLists({ docs: async () => ({ tools: [tool('needle', 'matches query'), tool('semantic', 'different wording')] }) });
+  registry.embeddingSearch = embeddingSearch(text => text.startsWith('needle\n') ? [1, 0] : [0, 1]);
+  try {
+    await registry.refresh();
+    const first = await registry.search({ query: 'needle', limit: 1 });
+    assert(first.nextCursor);
+    registry.embeddingSearch.rank = async () => { throw new Error('inference failed'); };
+    await assert.rejects(registry.search({ query: 'needle', limit: 1, cursor: first.nextCursor }), /CURSOR_STALE/);
+    assert.equal((await registry.search({ query: 'needle', limit: 1 })).tools[0].toolName, 'needle');
+  } finally {
+    await registry.close();
+  }
+});
+
+test('model load or inference failure in vector and hybrid modes falls back to BM25 search', async () => {
+  for (const mode of ['vector', 'hybrid']) for (const modelLoader of [
+    async () => { throw new Error('model unavailable'); },
+    async () => async () => { throw new Error('inference failed'); },
+  ]) {
+    const registry = registryWithLists({ docs: async () => ({ tools: [tool('other', 'unrelated'), tool('match', 'find alpha')] }) });
+    registry.embeddingSearch = new EmbeddingSearch({ modelLoader });
+    try {
+      await registry.refresh();
+      const result = await registry.search({ query: 'alpha', mode });
+      assert.equal(result.tools[0].toolName, 'match');
+      assert(result.tools[0].score > 0);
+    } finally {
+      await registry.close();
+    }
   }
 });
 
