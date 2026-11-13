@@ -60,6 +60,44 @@ function deferred() {
   return { promise, resolve };
 }
 
+test('truncated upstream text becomes an explicit error before caller parsing', async () => {
+  const registry = registryWithLists({ docs: async () => ({ tools: [tool('data')] }) });
+  try {
+    await registry.refresh();
+    const state = registry.servers.get('docs');
+    state.client.callTool = async () => ({ content: [{ type: 'text', text: '한'.repeat(21845) + 'x\n…[response truncated at 65536 bytes]' }] });
+    await assert.rejects(registry.call({ serverId: 'docs', toolName: 'data' }), /MCP_UPSTREAM_RESPONSE_TRUNCATED.*65536 byte/);
+    const similar = 'ordinary\n…[response truncated at 65536 bytes]';
+    state.client.callTool = async () => ({ content: [{ type: 'text', text: similar }] });
+    assert.equal((await registry.call({ serverId: 'docs', toolName: 'data' })).content[0].text, similar);
+    state.client.callTool = async () => ({ content: [{ type: 'text', text: '{"value":"complete"}' }] });
+    assert.equal((await registry.call({ serverId: 'docs', toolName: 'data' })).content[0].text, '{"value":"complete"}');
+    state.client.callTool = async () => ({ isError: true, content: [{ type: 'text', text: 'existing upstream failure' }] });
+    await assert.rejects(registry.call({ serverId: 'docs', toolName: 'data' }), /MCP_UPSTREAM_ERROR.*existing upstream failure/);
+  } finally {
+    await registry.close();
+  }
+});
+
+test('truncation error propagates through MCP cell execution', async () => {
+  const registry = registryWithLists({ docs: async () => ({ tools: [tool('data')] }) });
+  await registry.refresh();
+  registry.servers.get('docs').client.callTool = async () => ({ content: [{ type: 'text', text: 'x'.repeat(65536) + '\n…[response truncated at 65536 bytes]' }] });
+  const service = await serveHttp(new DolsotRuntime({ toolboxes: registry.toolboxes() }), { port: 0 });
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
+  try {
+    await client.connect(new StreamableHTTPClientTransport(new URL(service.url)));
+    const result = await client.callTool({ name: 'dolsot_run', arguments: { session: 'truncated', code: "await mcp.call({serverId:'docs',toolName:'data',arguments:{}})" } });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /MCP_UPSTREAM_RESPONSE_TRUNCATED.*65536 byte/);
+  } finally {
+    await client.close();
+    await service.close();
+    await registry.close();
+  }
+});
+
 test('stdio external MCP tools are discovered, BM25-ranked, called, and refreshed on list change', async () => {
   const registry = await makeRegistry();
   try {

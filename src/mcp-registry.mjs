@@ -605,6 +605,13 @@ export class McpRegistry {
         };
         throw mcpError('MCP_UPSTREAM_ERROR', JSON.stringify({ serverId, toolName, diagnostic: upstreamDiagnostic(diagnostic, state, args) }));
       }
+      for (const item of response.content ?? []) {
+        if (item.type !== 'text' || typeof item.text !== 'string') continue;
+        const match = item.text.match(/\n…\[response truncated at (\d+) bytes\]$/);
+        if (match && Buffer.byteLength(item.text.slice(0, match.index), 'utf8') === Number(match[1])) {
+          throw mcpError('MCP_UPSTREAM_RESPONSE_TRUNCATED', `Upstream response was truncated at its ${match[1]} byte limit; reduce page size.`);
+        }
+      }
       return response.structuredContent ?? response;
     } finally {
       this.activeCalls.delete(controller);
