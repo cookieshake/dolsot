@@ -182,6 +182,12 @@ test('HTTP MCP exposes run/session/reset tools over loopback Streamable HTTP', a
     assert.equal(first.structuredContent.value, '42');
     const second = await client.callTool({ name: 'dolsot_run', arguments: { session: 'http', code: 'n + 1' } });
     assert.equal(second.structuredContent.value, '41');
+    const overflow = await client.callTool({ name: 'dolsot_run', arguments: { session: 'http', code: "var saved = 'x'.repeat(32769); saved" } });
+    assert.equal(overflow.isError, true);
+    assert.match(overflow.content[0].text, /32769 bytes.*32768 bytes/);
+    assert.equal(overflow.structuredContent.value, null);
+    const recovered = await client.callTool({ name: 'dolsot_run', arguments: { session: 'http', code: 'saved.slice(0, 3)' } });
+    assert.equal(recovered.structuredContent.value, 'xxx');
     const sessions = await client.callTool({ name: 'dolsot_sessions', arguments: {} });
     assert(sessions.structuredContent.sessions.some(session => session.id === 'http'));
     const reset = await client.callTool({ name: 'dolsot_reset', arguments: { session: 'http' } });

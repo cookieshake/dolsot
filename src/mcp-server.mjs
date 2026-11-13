@@ -5,7 +5,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod/v4';
 
 function createServer(runtime) {
-  const server = new McpServer({ name: 'dolsot', version: '1.0.0-alpha.1' }, {
+  const server = new McpServer({ name: 'dolsot', version: '1.0.0-alpha.2' }, {
     capabilities: {},
     instructions: 'Run JavaScript with dolsot_run. Start with help() inside a cell to discover usage and available toolboxes, then <toolbox>.help() for method details. Reuse session to continue state; use dolsot_sessions to list and dolsot_reset to reset sessions.',
   });

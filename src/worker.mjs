@@ -7,7 +7,7 @@ const wasmBytes = await readFile(new URL(import.meta.resolve('quickjs-wasi/quick
 process.once('message', async request => {
   let vm;
   let stdout = '';
-  let truncated = false;
+  let outputBytes = 0;
   let nextToolCall = 0;
   const pendingTools = new Map();
   try {
@@ -41,8 +41,8 @@ process.once('message', async request => {
 
     const print = (...args) => {
       const line = `${args.map(arg => arg.toString()).join(' ')}\n`;
-      if (Buffer.byteLength(stdout) + Buffer.byteLength(line) <= request.maxOutputBytes) stdout += line;
-      else truncated = true;
+      outputBytes += Buffer.byteLength(line);
+      if (outputBytes <= request.maxOutputBytes) stdout += line;
       return vm.undefined;
     };
     if (request.snapshot) {
@@ -76,10 +76,6 @@ process.once('message', async request => {
         const completion = settled.value.getProp('value');
         const dumped = vm.dump(completion);
         value = dumped === undefined ? null : typeof dumped === 'string' ? dumped : JSON.stringify(dumped);
-        if (value !== null && Buffer.byteLength(value) > request.maxOutputBytes) {
-          value = Buffer.from(value).subarray(0, request.maxOutputBytes).toString('utf8');
-          truncated = true;
-        }
         completion.dispose();
         settled.value.dispose();
       }
@@ -91,6 +87,13 @@ process.once('message', async request => {
     if (pending) {
       const suffix = 'cell ended while toolbox calls were still pending';
       error = error ? `${error}; ${suffix}` : suffix;
+    }
+    outputBytes += Buffer.byteLength(value ?? '') + Buffer.byteLength(error ? `${error}\n` : '');
+    const exceeded = outputBytes > request.maxOutputBytes;
+    if (exceeded) {
+      error = `Response size (${outputBytes} bytes) exceeds the limit (${request.maxOutputBytes} bytes). Assign data to a variable and return only the fields you need, or save it in a variable and retrieve it in chunks across cells.`;
+      stdout = '';
+      value = null;
     }
     const ok = error === null;
     const text = `${stdout}${value ?? ''}${error ? `${error}\n` : ''}`;
@@ -104,7 +107,7 @@ process.once('message', async request => {
         text,
         save_error: null,
         dropped: [],
-        truncated,
+        truncated: false,
       };
     if (pending) {
       process.send({ discardSnapshot: true, abortTools: true, result }, () => {

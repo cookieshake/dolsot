@@ -11,7 +11,7 @@ const workerPath = fileURLToPath(new URL('./worker.mjs', import.meta.url));
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_CODE_BYTES = 256 * 1024;
 const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
-const MAX_OUTPUT_BYTES = 1024 * 1024;
+const DEFAULT_OUTPUT_BYTES = 32 * 1024;
 const MAX_TOOL_CALLS = 100;
 const MAX_TOOL_BYTES = 1024 * 1024;
 const MAX_TOOL_CONCURRENCY = 4;
@@ -41,7 +41,11 @@ function keyName(session) {
 }
 
 export class DolsotRuntime {
-  constructor({ sessionDir = process.env.DOLSOT_SESSION_DIR, timeoutMs = DEFAULT_TIMEOUT_MS, toolboxes = {} } = {}) {
+  constructor({ sessionDir = process.env.DOLSOT_SESSION_DIR, timeoutMs = DEFAULT_TIMEOUT_MS, maxOutputBytes = process.env.DOLSOT_MAX_OUTPUT_BYTES === undefined ? DEFAULT_OUTPUT_BYTES : Number(process.env.DOLSOT_MAX_OUTPUT_BYTES), toolboxes = {} } = {}) {
+    if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1) {
+      throw new RangeError('maxOutputBytes / DOLSOT_MAX_OUTPUT_BYTES must be a positive safe integer');
+    }
+    this.maxOutputBytes = maxOutputBytes;
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 20 * 60_000) {
       throw new RangeError('timeoutMs must be between 1 and 1200000');
     }
@@ -508,7 +512,7 @@ export class DolsotRuntime {
         timeoutMs,
         memoryLimit: MEMORY_LIMIT,
         maxStackSize: MAX_STACK_SIZE,
-        maxOutputBytes: MAX_OUTPUT_BYTES,
+        maxOutputBytes: this.maxOutputBytes,
         tools: serializedTools,
       });
       });

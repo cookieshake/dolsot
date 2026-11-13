@@ -285,3 +285,48 @@ test('the worker waiting queue rejects work after its configured capacity', asyn
   assert.match(result.error, /execution queue is full/);
   assert.equal(runtime.memory.has('queue-full'), false);
 });
+
+test('output byte limit counts all display output and preserves variables after failure', async () => {
+  const runtime = new DolsotRuntime({ maxOutputBytes: 10 });
+  assert.equal((await runtime.run('limit', "'a'.repeat(10)")).ok, true);
+  const failed = await runtime.run('limit', "var data = '한'.repeat(4); print('x'); data");
+  assert.equal(failed.ok, false);
+  assert.equal(failed.value, null);
+  assert.equal(failed.stdout, '');
+  assert.match(failed.error, /14 bytes.*10 bytes/);
+  assert.match(failed.error, /variable.*chunks/);
+  assert.equal((await runtime.run('limit', 'data.slice(0, 2)')).value, '한한');
+  const many = await runtime.run('limit', "print('1234'); print('5678'); 'x'");
+  assert.match(many.error, /11 bytes.*10 bytes/);
+});
+
+test('output limit supports environment, constructor override and validation', async () => {
+  const prior = process.env.DOLSOT_MAX_OUTPUT_BYTES;
+  try {
+    process.env.DOLSOT_MAX_OUTPUT_BYTES = '4';
+    assert.match((await new DolsotRuntime().run('envlimit', "'abcde'")).error, /5 bytes.*4 bytes/);
+    assert.equal((await new DolsotRuntime({ maxOutputBytes: 5 }).run('override', "'abcde'")).ok, true);
+    process.env.DOLSOT_MAX_OUTPUT_BYTES = 'bad';
+    assert.throws(() => new DolsotRuntime(), /positive safe integer/);
+    assert.throws(() => new DolsotRuntime({ maxOutputBytes: 0 }), /positive safe integer/);
+  } finally {
+    if (prior === undefined) delete process.env.DOLSOT_MAX_OUTPUT_BYTES;
+    else process.env.DOLSOT_MAX_OUTPUT_BYTES = prior;
+  }
+});
+
+test('large toolbox result stays usable after output limit error', async () => {
+  const runtime = new DolsotRuntime({ maxOutputBytes: 32, toolboxes: {
+    fixture: { fetch: { handler: async () => ({ text: 'x'.repeat(100) }) } },
+  } });
+  const failed = await runtime.run('large-tool', 'var saved = await fixture.fetch({}); saved.text');
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /100 bytes.*32 bytes/);
+  assert.equal((await runtime.run('large-tool', 'saved.text.slice(0, 10)')).value, 'xxxxxxxxxx');
+});
+
+test('default output limit is 32768 UTF-8 bytes', async () => {
+  const runtime = new DolsotRuntime();
+  assert.equal((await runtime.run('default-limit', "'x'.repeat(32768)")).ok, true);
+  assert.match((await runtime.run('default-limit', "'x'.repeat(32769)")).error, /32769 bytes.*32768 bytes/);
+});
